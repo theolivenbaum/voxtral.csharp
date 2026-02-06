@@ -234,6 +234,17 @@ void vox_metal_warmup_merged_3(const uint16_t *a, size_t a_n,
                                 const uint16_t *b, size_t b_n,
                                 const uint16_t *c, size_t c_n);
 
+/*
+ * Monolithic encoder step: all 32 layers + final norm in ONE command buffer.
+ * Requires encoder KV cache allocated with vox_metal_shared_alloc().
+ * x is [new_len, VOX_ENC_DIM] float, modified in-place with the output.
+ * rope_freqs: [new_len, head_dim/2, 2] precomputed frequencies.
+ * cache_len: current number of positions in the KV cache.
+ * Returns 0 on success, -1 on failure.
+ */
+int vox_metal_encoder_full_step(void *ctx, float *x, int new_len,
+                                 const float *rope_freqs, int cache_len);
+
 /* GPU memory usage (for debugging). */
 size_t vox_metal_memory_used(void);
 

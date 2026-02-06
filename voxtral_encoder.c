@@ -325,8 +325,37 @@ static float *enc_kv_cache_v_at(vox_ctx_t *ctx, int layer, int pos) {
     return ctx->enc_kv_cache_v + ((size_t)layer * ctx->enc_kv_cache_max + pos) * ENC_KV_DIM;
 }
 
+int vox_encoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_pos) {
+    if (ctx->enc_kv_cache_k) return 0; /* already allocated */
+
+    size_t total = (size_t)VOX_ENC_LAYERS * max_pos * ENC_KV_DIM * sizeof(float);
+
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        ctx->enc_kv_cache_k = (float *)vox_metal_shared_alloc(total);
+        ctx->enc_kv_cache_v = (float *)vox_metal_shared_alloc(total);
+        ctx->enc_kv_cache_is_shared = 1;
+    } else
+#endif
+    {
+        ctx->enc_kv_cache_k = (float *)calloc(1, total);
+        ctx->enc_kv_cache_v = (float *)calloc(1, total);
+    }
+
+    if (!ctx->enc_kv_cache_k || !ctx->enc_kv_cache_v) return -1;
+    ctx->enc_kv_cache_max = max_pos;
+    return 0;
+}
+
 static int enc_kv_cache_grow(vox_ctx_t *ctx, int required) {
     if (ctx->enc_kv_cache_max >= required) return 0;
+
+    /* Shared GPU memory cannot be grown; should not happen with proper pre-allocation */
+    if (ctx->enc_kv_cache_is_shared) {
+        fprintf(stderr, "encoder: KV cache too small (%d < %d), cannot grow shared buffer\n",
+                ctx->enc_kv_cache_max, required);
+        return -1;
+    }
 
     int new_max = ctx->enc_kv_cache_max ? ctx->enc_kv_cache_max : 256;
     while (new_max < required) new_max *= 2;
@@ -474,6 +503,18 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     for (int i = 0; i < new_len; i++) positions[i] = logical_start + i;
     float *rope_freqs = ctx->enc_inc_rope_freqs;
     vox_compute_rope_freqs(rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
+
+    /* GPU monolithic path: all 32 layers in one command buffer */
+#ifdef USE_METAL
+    if (vox_metal_available() && ctx->enc_kv_cache_is_shared) {
+        if (vox_metal_encoder_full_step(ctx, x, new_len, rope_freqs, cache_len) == 0) {
+            ctx->enc_kv_cache_len = cache_len + new_len;
+            *out_len = new_len;
+            return x;
+        }
+        /* Fall through to CPU path on failure */
+    }
+#endif
 
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
         vox_enc_layer_t *l = &enc->layers[layer];

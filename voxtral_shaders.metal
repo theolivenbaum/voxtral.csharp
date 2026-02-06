@@ -441,3 +441,72 @@ kernel void encoder_attention(
         out_row[tid] = acc / (running_sum + 1e-10f);
     }
 }
+
+/* ========================================================================
+ * Bias add: data[s * dim + j] += bias[j] for each row s.
+ * data: [seq_len, dim], bias: [dim].
+ * ======================================================================== */
+
+kernel void bias_add(
+    device float *data [[buffer(0)]],
+    device const float *bias [[buffer(1)]],
+    constant int &dim [[buffer(2)]],
+    constant int &total [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid < total) {
+        data[gid] += bias[gid % dim];
+    }
+}
+
+/* ========================================================================
+ * Batched RoPE: apply rotary embeddings to [seq_len, n_heads, head_dim].
+ * freqs: [seq_len, head_dim/2, 2] = per-position (cos, sin) pairs.
+ * One thread per (position, head, half_dim_index) triple.
+ * ======================================================================== */
+
+kernel void batched_rope_apply(
+    device float *data [[buffer(0)]],
+    device const float *freqs [[buffer(1)]],
+    constant int &n_heads [[buffer(2)]],
+    constant int &head_dim [[buffer(3)]],
+    constant int &seq_len [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int half_dim = head_dim / 2;
+    int per_pos = n_heads * half_dim;
+    int total = seq_len * per_pos;
+    if ((int)gid >= total) return;
+
+    int pos = (int)gid / per_pos;
+    int rem = (int)gid % per_pos;
+    int head = rem / half_dim;
+    int i = rem % half_dim;
+
+    float cos_val = freqs[(pos * half_dim + i) * 2];
+    float sin_val = freqs[(pos * half_dim + i) * 2 + 1];
+
+    int base = (pos * n_heads + head) * head_dim;
+    float x0 = data[base + i * 2];
+    float x1 = data[base + i * 2 + 1];
+
+    data[base + i * 2]     = x0 * cos_val - x1 * sin_val;
+    data[base + i * 2 + 1] = x0 * sin_val + x1 * cos_val;
+}
+
+/* ========================================================================
+ * Batched KV cache copy: write [seq_len, kv_dim] to cache at offset.
+ * cache: large buffer, data copied to cache[cache_offset + gid].
+ * ======================================================================== */
+
+kernel void batched_kv_cache_copy(
+    device float *cache [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant int &cache_offset [[buffer(2)]],
+    constant int &total [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid < total) {
+        cache[cache_offset + gid] = data[gid];
+    }
+}

@@ -182,6 +182,7 @@ typedef struct {
     float *enc_kv_cache_v;    /* [ENC_LAYERS, max_seq, enc_kv_dim] */
     int enc_kv_cache_len;     /* physical cache length */
     int enc_kv_cache_max;     /* allocated capacity */
+    int enc_kv_cache_is_shared; /* allocated with vox_metal_shared_alloc */
     int enc_kv_pos_offset;    /* logical offset from rolling compaction */
 
     /* Persistent incremental-encoder scratch (allocated/grown on demand). */
@@ -311,5 +312,6 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
 /* Decoder forward pass for prefill (multiple tokens) */
 void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len);
 int vox_decoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_seq);
+int vox_encoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_pos);
 
 #endif /* VOXTRAL_H */

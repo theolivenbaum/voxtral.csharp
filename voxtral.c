@@ -227,6 +227,9 @@ vox_ctx_t *vox_load(const char *model_dir) {
         /* Pre-allocate KV cache (shared GPU memory) */
         vox_decoder_kv_cache_preallocate(ctx, VOX_DEC_WINDOW + 1024);
 
+        /* Pre-allocate encoder KV cache (shared GPU memory for monolithic step) */
+        vox_encoder_kv_cache_preallocate(ctx, VOX_ENC_WINDOW + 256);
+
         if (vox_verbose >= 1)
             fprintf(stderr, "Metal GPU: %.1f MB\n",
                     vox_metal_memory_used() / (1024.0 * 1024.0));
@@ -284,8 +287,16 @@ void vox_free(vox_ctx_t *ctx) {
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
 #endif
-    free(ctx->enc_kv_cache_k);
-    free(ctx->enc_kv_cache_v);
+#ifdef USE_METAL
+    if (ctx->enc_kv_cache_is_shared) {
+        vox_metal_shared_free(ctx->enc_kv_cache_k);
+        vox_metal_shared_free(ctx->enc_kv_cache_v);
+    } else
+#endif
+    {
+        free(ctx->enc_kv_cache_k);
+        free(ctx->enc_kv_cache_v);
+    }
     free(ctx->ada_scale);
     free(ctx->enc_inc_x_norm);
     free(ctx->enc_inc_q);
