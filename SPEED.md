@@ -17,7 +17,7 @@
 ## Current Baseline (2026-02-06)
 - Decoder: 23.7 ms/token (was 43.2 at start)
 - Prefill: ~335ms (was ~1200ms)
-- Encoder: ~310ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
+- Encoder: ~298ms (test_speech.wav, 3.6s audio) (was ~2.7s at start)
 - Theoretical decoder floor: ~23 ms/token (300 GB/s bandwidth, 6.9 GB weights)
 - Remaining decoder overhead: 1 command buffer per token
 
@@ -130,11 +130,24 @@
 - Fixed ada_scale_mul shader: added stride parameter for M>1 (was reading out-of-bounds)
 - **Result: prefill 380 → 338 ms (test_speech), 380 → 327 ms (jfk) — 11-14% faster**
 
+### Attempt 12: Merged encoder weights (SUCCESS — modest)
+- Merged Q+K+V into single MPS matmul per encoder layer (3→1 encode)
+  - New `deinterleave` Metal shader splits [M, 6144] → separate Q, K, V buffers
+- Merged w1+w3 into single MPS matmul per encoder layer (2→1 encode)
+  - New `silu_mul_merged` shader: fused silu+mul on interleaved [M, hidden*2] layout
+  - w2 matmul uses strided rowBytes (hidden*2) to read directly from merged output
+- Net: 7→4 MPS matmul encodes per layer × 32 layers = 96 fewer encodes
+- MPS encoding overhead: 20ms → 14ms (saved 6ms)
+- Larger merged matmuls slightly more efficient on GPU (better utilization)
+- **Result: encoder ~310 → ~298 ms (test_speech) — 4% faster**
+- jfk shows similar improvement (~690 → ~705ms, within noise)
+
 ### Next targets
 - Decoder: ~23.7 ms/step, theoretical floor ~23 ms (0.7ms gap, near bandwidth limit)
-- Encoder: ~310ms for test_speech
-  - MPS matmul encoding overhead: ~576 encodes per step × ~0.15ms each
-  - Ideas: merged QKV weights (3→1 encode per layer), merged w1+w3 (needs strided silu)
+- Encoder: ~298ms for test_speech
+  - MPS encoding overhead now only ~14ms (not the bottleneck)
+  - GPU compute dominates: matmul + attention scaling with KV cache length
+  - Attention is near memory bandwidth limit for large KV caches
 - Prefill: ~335ms, dominated by GPU compute (M=38 matmuls through 26 layers)
   - MPS pipeline warmup on first command buffer still ~200ms
 

@@ -164,20 +164,25 @@ vox_ctx_t *vox_load(const char *model_dir) {
         if (vox_verbose >= 2)
             fprintf(stderr, "Pre-warming Metal weight cache...\n");
 
-        /* Encoder weights (32 layers) */
+        /* Encoder weights: merged QKV + merged w1+w3 (replaces individual caching)
+         * wo and w2 still cached individually. */
         for (int i = 0; i < VOX_ENC_LAYERS; i++) {
             vox_enc_layer_t *l = &ctx->encoder.layers[i];
             size_t enc_attn = (size_t)(VOX_ENC_HEADS * VOX_ENC_HEAD_DIM) * VOX_ENC_DIM;
             size_t enc_wo   = (size_t)VOX_ENC_DIM * (VOX_ENC_HEADS * VOX_ENC_HEAD_DIM);
             size_t enc_ffn1 = (size_t)VOX_ENC_HIDDEN * VOX_ENC_DIM;
             size_t enc_ffn2 = (size_t)VOX_ENC_DIM * VOX_ENC_HIDDEN;
-            vox_metal_warmup_bf16(l->wq_weight_bf16, enc_attn);
-            vox_metal_warmup_bf16(l->wk_weight_bf16, enc_attn);
-            vox_metal_warmup_bf16(l->wv_weight_bf16, enc_attn);
+            /* Merged QKV and w1+w3 (internally caches individual f16 buffers too) */
+            vox_metal_warmup_merged_3(
+                l->wq_weight_bf16, enc_attn,
+                l->wk_weight_bf16, enc_attn,
+                l->wv_weight_bf16, enc_attn);
+            vox_metal_warmup_merged_2(
+                l->w1_weight_bf16, enc_ffn1,
+                l->w3_weight_bf16, enc_ffn1);
+            /* wo and w2 used individually */
             vox_metal_warmup_bf16(l->wo_weight_bf16, enc_wo);
-            vox_metal_warmup_bf16(l->w1_weight_bf16, enc_ffn1);
             vox_metal_warmup_bf16(l->w2_weight_bf16, enc_ffn2);
-            vox_metal_warmup_bf16(l->w3_weight_bf16, enc_ffn1);
         }
 
         /* Adapter weights */

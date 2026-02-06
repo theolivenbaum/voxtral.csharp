@@ -516,3 +516,48 @@ kernel void batched_kv_cache_copy(
         cache[cache_offset + gid] = data[gid];
     }
 }
+
+/* ========================================================================
+ * Deinterleave: copy one column slice from [M, total_cols] to [M, chunk_cols].
+ * src layout: row i -> [col_0..col_{total_cols-1}]
+ * dst layout: row i -> [col_offset..col_offset+chunk_cols-1] extracted contiguously.
+ * total threads = M * chunk_cols.
+ * ======================================================================== */
+
+kernel void deinterleave(
+    device const float *src [[buffer(0)]],
+    device float *dst [[buffer(1)]],
+    constant int &src_stride [[buffer(2)]],    /* total cols per src row */
+    constant int &chunk_cols [[buffer(3)]],    /* cols to copy per row */
+    constant int &col_offset [[buffer(4)]],    /* start column in src row */
+    constant int &total [[buffer(5)]],         /* M * chunk_cols */
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= total) return;
+    int row = (int)gid / chunk_cols;
+    int col = (int)gid % chunk_cols;
+    dst[gid] = src[row * src_stride + col_offset + col];
+}
+
+/* ========================================================================
+ * Fused SiLU + multiply for merged w1+w3 output.
+ * Data layout: [M, hidden*2] where each row is [gate(hidden), up(hidden)].
+ * gate = silu(gate), gate *= up.  In-place.
+ * total threads = M * hidden.
+ * ======================================================================== */
+
+kernel void silu_mul_merged(
+    device float *data [[buffer(0)]],
+    constant int &hidden [[buffer(1)]],     /* 5120 */
+    constant int &total [[buffer(2)]],      /* M * hidden */
+    uint gid [[thread_position_in_grid]]
+) {
+    if ((int)gid >= total) return;
+    int row = (int)gid / hidden;
+    int col = (int)gid % hidden;
+    int idx_gate = row * hidden * 2 + col;
+    int idx_up = idx_gate + hidden;
+    float g = data[idx_gate];
+    g = g / (1.0f + exp(-g));  /* silu */
+    data[idx_gate] = g * data[idx_up];
+}
