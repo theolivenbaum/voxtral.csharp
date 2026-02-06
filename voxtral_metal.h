@@ -140,6 +140,56 @@ int vox_metal_fused_logits_bf16(int dim, int vocab_size,
                                   float *logits_out);
 
 /*
+ * Persistent-x decoder step API.
+ * Keeps x on GPU across all 26 layers to fuse wo_ffn[i] + norm_qkv[i+1]
+ * in one command buffer. Halves command buffer count: 53 → 27 per token.
+ */
+
+/* Upload x to persistent GPU buffer (call before decoder loop). */
+void vox_metal_decoder_start(const float *x, int dim);
+
+/* Release persistent GPU x (call after decoder loop). */
+void vox_metal_decoder_end(void);
+
+/* First layer: rms_norm + QKV from persistent GPU x. (1 cmd buf) */
+void vox_metal_decoder_norm_qkv(int K,
+                                  const float *norm_weight, float eps,
+                                  const uint16_t *wq_bf16, int Nq,
+                                  const uint16_t *wk_bf16, int Nk,
+                                  const uint16_t *wv_bf16, int Nv,
+                                  float *q, float *k, float *v);
+
+/* Cross-layer: wo+FFN (updates GPU x) + norm+QKV for next layer. (1 cmd buf)
+ * Fuses 10 wo+FFN steps + 4 norm+QKV steps into a single command buffer. */
+void vox_metal_decoder_wo_ffn_next_qkv(int dim, int q_dim, int hidden,
+                                         const float *attn_out,
+                                         const uint16_t *wo_bf16,
+                                         const float *ffn_norm, float eps,
+                                         const float *ada_scale,
+                                         const uint16_t *w1_bf16,
+                                         const uint16_t *w3_bf16,
+                                         const uint16_t *w2_bf16,
+                                         const float *next_attn_norm,
+                                         const uint16_t *next_wq_bf16, int next_Nq,
+                                         const uint16_t *next_wk_bf16, int next_Nk,
+                                         const uint16_t *next_wv_bf16, int next_Nv,
+                                         float *q, float *k, float *v);
+
+/* Final layer: wo+FFN (updates GPU x) + logits + argmax. (1 cmd buf)
+ * Returns token ID. logits_out may be NULL. */
+int vox_metal_decoder_wo_ffn_logits(int dim, int q_dim, int hidden, int vocab_size,
+                                      const float *attn_out,
+                                      const uint16_t *wo_bf16,
+                                      const float *ffn_norm, float eps,
+                                      const float *ada_scale,
+                                      const uint16_t *w1_bf16,
+                                      const uint16_t *w3_bf16,
+                                      const uint16_t *w2_bf16,
+                                      const float *final_norm,
+                                      const uint16_t *tok_emb_bf16,
+                                      float *logits_out);
+
+/*
  * Pre-warm the bf16->f16 cache for a weight tensor.
  * Call during model loading to avoid first-use latency.
  */

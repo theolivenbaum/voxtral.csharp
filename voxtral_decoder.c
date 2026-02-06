@@ -375,92 +375,120 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     int positions[1] = { logical_pos };
     vox_compute_rope_freqs(rope_freqs, positions, 1, head_dim, VOX_ROPE_THETA);
 
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        /* Cross-layer fused path: keeps x on GPU across all layers.
+         * 27 command buffers per token (vs 53 without cross-layer fusion). */
+        vox_metal_decoder_start(x, dim);
+
+        /* Layer 0: norm + QKV only */
+        vox_metal_decoder_norm_qkv(dim,
+            dec->layers[0].attention_norm, VOX_DEC_NORM_EPS,
+            dec->layers[0].wq_weight_bf16, q_dim,
+            dec->layers[0].wk_weight_bf16, kv_dim,
+            dec->layers[0].wv_weight_bf16, kv_dim,
+            q, k, v);
+
+        vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
+        vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
+        memcpy(kv_cache_k_at(ctx, 0, pos), k, kv_dim * sizeof(float));
+        memcpy(kv_cache_v_at(ctx, 0, pos), v, kv_dim * sizeof(float));
+        vox_causal_attention(attn_out, q,
+                             kv_cache_k_at(ctx, 0, 0), kv_cache_v_at(ctx, 0, 0),
+                             1, pos + 1, n_heads, n_kv_heads,
+                             head_dim, scale, VOX_DEC_WINDOW, pos);
+
+        /* Layers 1..25: fused wo_ffn[prev] + norm_qkv[curr] */
+        for (int layer = 1; layer < VOX_DEC_LAYERS; layer++) {
+            vox_dec_layer_t *prev = &dec->layers[layer - 1];
+            vox_dec_layer_t *curr = &dec->layers[layer];
+            const float *ada_s = ctx->ada_scale ?
+                ctx->ada_scale + (size_t)(layer - 1) * dim : NULL;
+
+            vox_metal_decoder_wo_ffn_next_qkv(dim, q_dim, hidden,
+                attn_out, prev->wo_weight_bf16,
+                prev->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                prev->w1_weight_bf16, prev->w3_weight_bf16, prev->w2_weight_bf16,
+                curr->attention_norm,
+                curr->wq_weight_bf16, q_dim,
+                curr->wk_weight_bf16, kv_dim,
+                curr->wv_weight_bf16, kv_dim,
+                q, k, v);
+
+            vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
+            vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
+            memcpy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
+            memcpy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
+            vox_causal_attention(attn_out, q,
+                                 kv_cache_k_at(ctx, layer, 0),
+                                 kv_cache_v_at(ctx, layer, 0),
+                                 1, pos + 1, n_heads, n_kv_heads,
+                                 head_dim, scale, VOX_DEC_WINDOW, pos);
+        }
+
+        /* Final: wo_ffn[25] + logits + argmax */
+        {
+            vox_dec_layer_t *last = &dec->layers[VOX_DEC_LAYERS - 1];
+            const float *ada_s = ctx->ada_scale ?
+                ctx->ada_scale + (size_t)(VOX_DEC_LAYERS - 1) * dim : NULL;
+
+            int token = vox_metal_decoder_wo_ffn_logits(dim, q_dim, hidden,
+                VOX_VOCAB_SIZE, attn_out, last->wo_weight_bf16,
+                last->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                last->w1_weight_bf16, last->w3_weight_bf16, last->w2_weight_bf16,
+                dec->norm, dec->tok_embeddings_bf16, logits);
+
+            vox_metal_decoder_end();
+            ctx->kv_cache_len = pos + 1;
+            return token;
+        }
+    }
+#endif
+
+    /* CPU fallback path */
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
 
-        /* RMSNorm + Q, K, V projections */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            vox_metal_fused_norm_qkv_bf16(1, dim, x,
-                                           l->attention_norm, VOX_DEC_NORM_EPS,
-                                           l->wq_weight_bf16, q_dim,
-                                           l->wk_weight_bf16, kv_dim,
-                                           l->wv_weight_bf16, kv_dim,
-                                           q, k, v);
-        } else {
-#endif
-            vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
-            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
-            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
-#ifdef USE_METAL
-        }
-#endif
+        vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
+        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
+        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
+        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
 
-        /* Apply RoPE */
         vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
         vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
 
-        /* Store K, V in cache */
         memcpy(kv_cache_k_at(ctx, layer, pos), k, kv_dim * sizeof(float));
         memcpy(kv_cache_v_at(ctx, layer, pos), v, kv_dim * sizeof(float));
 
-        /* Attention over cached sequence */
         int total_seq = pos + 1;
         float *full_k = kv_cache_k_at(ctx, layer, 0);
         float *full_v = kv_cache_v_at(ctx, layer, 0);
 
-        float scale = 1.0f / sqrtf((float)head_dim);
         vox_causal_attention(attn_out, q, full_k, full_v,
                              1, total_seq, n_heads, n_kv_heads,
                              head_dim, scale, VOX_DEC_WINDOW, pos);
 
-        /* Output projection + residual + FFN */
-#ifdef USE_METAL
-        if (vox_metal_available()) {
-            const float *ada_s = ctx->ada_scale ?
-                ctx->ada_scale + (size_t)layer * dim : NULL;
-            vox_metal_fused_wo_ffn_bf16(1, dim, q_dim, hidden,
-                                         x, attn_out,
-                                         l->wo_weight_bf16,
-                                         l->ffn_norm, VOX_DEC_NORM_EPS,
-                                         ada_s,
-                                         l->w1_weight_bf16,
-                                         l->w3_weight_bf16,
-                                         l->w2_weight_bf16);
-        } else {
-#endif
-            vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
-            vox_add_inplace(x, proj_out, dim);
+        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+        vox_add_inplace(x, proj_out, dim);
 
-            vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
-            if (ctx->ada_scale) {
-                const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
-                for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
-            }
-
-            vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
-            vox_silu(gate_buf, hidden);
-            vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
-            vox_mul_inplace(gate_buf, up_buf, hidden);
-            vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
-            vox_add_inplace(x, ffn_out, dim);
-#ifdef USE_METAL
+        vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
+        if (ctx->ada_scale) {
+            const float *ada_s = ctx->ada_scale + (size_t)layer * dim;
+            for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
         }
-#endif
+
+        vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
+        vox_silu(gate_buf, hidden);
+        vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
+        vox_mul_inplace(gate_buf, up_buf, hidden);
+        vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+        vox_add_inplace(x, ffn_out, dim);
     }
 
     ctx->kv_cache_len = pos + 1;
 
-    /* Final norm + logits + argmax */
-#ifdef USE_METAL
-    if (vox_metal_available()) {
-        return vox_metal_fused_logits_bf16(dim, VOX_VOCAB_SIZE, x,
-                                            dec->norm, VOX_DEC_NORM_EPS,
-                                            dec->tok_embeddings_bf16,
-                                            logits);
-    }
-#endif
     vox_rms_norm(x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
     vox_matmul_t_bf16(logits, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
 

@@ -37,6 +37,9 @@ static id<MTLComputePipelineState> g_ada_scale_mul_pipeline = nil;
 static id<MTLComputePipelineState> g_argmax_pipeline = nil;
 static int g_shaders_initialized = 0;
 
+/* Persistent GPU x buffer for cross-layer decoder fusion */
+static id<MTLBuffer> g_dec_x = nil;
+
 /* ========================================================================
  * BF16 -> F16 Conversion
  * MPS only supports mixed f32/f16 matmul, not f32/bf16.
@@ -417,6 +420,8 @@ void vox_metal_shutdown(void) {
         clear_weight_cache();
         clear_activation_pool();
         clear_matmul_op_cache();
+
+        g_dec_x = nil;
 
         g_rms_norm_pipeline = nil;
         g_silu_pipeline = nil;
@@ -1388,6 +1393,584 @@ void vox_metal_fused_wo_ffn_bf16(int M, int dim, int q_dim, int hidden,
         pool_release_buffer(bufUp);
         pool_release_buffer(bufFfnOut);
     }
+}
+
+/* ========================================================================
+ * Persistent-x Decoder Step API
+ *
+ * Keeps x on GPU across all 26 decoder layers. Fuses wo_ffn[i] +
+ * norm_qkv[i+1] into a single command buffer per layer transition.
+ * Reduces command buffers from 53 to 27 per token.
+ * ======================================================================== */
+
+void vox_metal_decoder_start(const float *x, int dim) {
+    if (!g_initialized) return;
+    size_t size = (size_t)dim * sizeof(float);
+    if (!g_dec_x || [g_dec_x length] < size) {
+        g_dec_x = [g_device newBufferWithLength:size
+                                        options:MTLResourceStorageModeShared];
+    }
+    memcpy([g_dec_x contents], x, size);
+}
+
+void vox_metal_decoder_end(void) {
+    /* Keep g_dec_x allocated for reuse across tokens */
+}
+
+/* Helper: encode wo+FFN steps into a command buffer (steps 1-10).
+ * Reads attn_out from bufAttn, updates g_dec_x in-place.
+ * Returns bufXnorm (output of FFN rms_norm, needed for next step).
+ * Caller must pool_release all returned buffers after commit. */
+static void encode_wo_ffn_steps(id<MTLCommandBuffer> cmdBuffer,
+                                  id<MTLBuffer> bufAttn,
+                                  id<MTLBuffer> bufProj,
+                                  id<MTLBuffer> bufXnorm,
+                                  id<MTLBuffer> bufGate,
+                                  id<MTLBuffer> bufUp,
+                                  id<MTLBuffer> bufFfnOut,
+                                  int dim, int q_dim, int hidden,
+                                  const uint16_t *wo_bf16,
+                                  const float *ffn_norm, float eps,
+                                  const float *ada_scale,
+                                  const uint16_t *w1_bf16,
+                                  const uint16_t *w3_bf16,
+                                  const uint16_t *w2_bf16) {
+    int M = 1;
+
+    id<MTLBuffer> bufWo = get_cached_bf16_as_f16_buffer(wo_bf16, (size_t)dim * q_dim);
+    id<MTLBuffer> bufW1 = get_cached_bf16_as_f16_buffer(w1_bf16, (size_t)hidden * dim);
+    id<MTLBuffer> bufW3 = get_cached_bf16_as_f16_buffer(w3_bf16, (size_t)hidden * dim);
+    id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(w2_bf16, (size_t)dim * hidden);
+    id<MTLBuffer> bufNorm = get_cached_weight_buffer(ffn_norm, dim * sizeof(float));
+    id<MTLBuffer> bufAda = ada_scale ?
+        get_cached_weight_buffer(ada_scale, dim * sizeof(float)) : nil;
+
+    /* Step 1: proj = attn_out @ wo^T */
+    {
+        MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:q_dim
+                            rowBytes:q_dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:dim columns:q_dim
+                            rowBytes:q_dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:dim
+                            rowBytes:dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matA = [[MPSMatrix alloc] initWithBuffer:bufAttn descriptor:descA];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWo descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufProj descriptor:descOut];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, dim, q_dim, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matA rightMatrix:matW resultMatrix:matOut];
+    }
+
+    /* Step 2: x += proj */
+    {
+        int n = M * dim;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_add_inplace_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufProj offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_add_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+    }
+
+    /* Step 3: x_norm = rms_norm(x, ffn_norm) */
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufNorm offset:0 atIndex:1];
+        [enc setBuffer:bufXnorm offset:0 atIndex:2];
+        [enc setBytes:&dim length:sizeof(int) atIndex:3];
+        [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    /* Step 4: x_norm *= (1 + ada_scale) */
+    if (bufAda) {
+        int n = M * dim;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_ada_scale_mul_pipeline];
+        [enc setBuffer:bufXnorm offset:0 atIndex:0];
+        [enc setBuffer:bufAda offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_ada_scale_mul_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+    }
+
+    /* Step 5: gate = x_norm @ w1^T */
+    {
+        MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:dim
+                            rowBytes:dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:hidden columns:dim
+                            rowBytes:dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descH = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:hidden
+                            rowBytes:hidden * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matIn = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descIn];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW1 descriptor:descW];
+        MPSMatrix *matGate = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descH];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, hidden, dim, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn rightMatrix:matW resultMatrix:matGate];
+    }
+
+    /* Step 6: up = x_norm @ w3^T */
+    {
+        MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:dim
+                            rowBytes:dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:hidden columns:dim
+                            rowBytes:dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descH = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:hidden
+                            rowBytes:hidden * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matIn = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descIn];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW3 descriptor:descW];
+        MPSMatrix *matUp = [[MPSMatrix alloc] initWithBuffer:bufUp descriptor:descH];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, hidden, dim, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn rightMatrix:matW resultMatrix:matUp];
+    }
+
+    /* Step 7: silu(gate) */
+    {
+        int n = M * hidden;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_silu_pipeline];
+        [enc setBuffer:bufGate offset:0 atIndex:0];
+        [enc setBytes:&n length:sizeof(int) atIndex:1];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_silu_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+    }
+
+    /* Step 8: gate *= up */
+    {
+        int n = M * hidden;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_mul_inplace_pipeline];
+        [enc setBuffer:bufGate offset:0 atIndex:0];
+        [enc setBuffer:bufUp offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_mul_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+    }
+
+    /* Step 9: ffn_out = gate @ w2^T */
+    {
+        MPSMatrixDescriptor *descH = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:hidden
+                            rowBytes:hidden * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:dim columns:hidden
+                            rowBytes:hidden * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:dim
+                            rowBytes:dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matGate = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descH];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW2 descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufFfnOut descriptor:descOut];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, dim, hidden, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matGate rightMatrix:matW resultMatrix:matOut];
+    }
+
+    /* Step 10: x += ffn_out */
+    {
+        int n = M * dim;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_add_inplace_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufFfnOut offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_add_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+    }
+}
+
+/* Helper: encode rms_norm + QKV matmuls from g_dec_x into a command buffer.
+ * Appends to an already-open command buffer. */
+static void encode_norm_qkv_steps(id<MTLCommandBuffer> cmdBuffer,
+                                    id<MTLBuffer> bufXnorm,
+                                    id<MTLBuffer> bufQ, id<MTLBuffer> bufK, id<MTLBuffer> bufV,
+                                    int K,
+                                    const float *norm_weight, float eps,
+                                    const uint16_t *wq_bf16, int Nq,
+                                    const uint16_t *wk_bf16, int Nk,
+                                    const uint16_t *wv_bf16, int Nv) {
+    int M = 1;
+
+    id<MTLBuffer> bufWq = get_cached_bf16_as_f16_buffer(wq_bf16, (size_t)Nq * K);
+    id<MTLBuffer> bufWk = get_cached_bf16_as_f16_buffer(wk_bf16, (size_t)Nk * K);
+    id<MTLBuffer> bufWv = get_cached_bf16_as_f16_buffer(wv_bf16, (size_t)Nv * K);
+    id<MTLBuffer> bufNorm = get_cached_weight_buffer(norm_weight, K * sizeof(float));
+
+    /* rms_norm(g_dec_x, norm_weight) → bufXnorm */
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufNorm offset:0 atIndex:1];
+        [enc setBuffer:bufXnorm offset:0 atIndex:2];
+        int hidden = K;
+        [enc setBytes:&hidden length:sizeof(int) atIndex:3];
+        [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    /* Input descriptor for QKV matmuls */
+    MPSMatrixDescriptor *descInput = [MPSMatrixDescriptor
+        matrixDescriptorWithRows:M columns:K
+                        rowBytes:K * sizeof(float)
+                        dataType:MPSDataTypeFloat32];
+    MPSMatrix *matInput = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descInput];
+
+    /* Q = x_norm @ Wq^T */
+    {
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:Nq columns:K
+                            rowBytes:K * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:Nq
+                            rowBytes:Nq * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWq descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufQ descriptor:descOut];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, Nq, K, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matOut];
+    }
+
+    /* K = x_norm @ Wk^T */
+    {
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:Nk columns:K
+                            rowBytes:K * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:Nk
+                            rowBytes:Nk * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWk descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufK descriptor:descOut];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, Nk, K, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matOut];
+    }
+
+    /* V = x_norm @ Wv^T */
+    {
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:Nv columns:K
+                            rowBytes:K * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:Nv
+                            rowBytes:Nv * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufWv descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufV descriptor:descOut];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, Nv, K, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matInput rightMatrix:matW resultMatrix:matOut];
+    }
+}
+
+void vox_metal_decoder_norm_qkv(int K,
+                                  const float *norm_weight, float eps,
+                                  const uint16_t *wq_bf16, int Nq,
+                                  const uint16_t *wk_bf16, int Nk,
+                                  const uint16_t *wv_bf16, int Nv,
+                                  float *q_out, float *k_out, float *v_out) {
+    if (!g_initialized || !g_shaders_initialized || !g_dec_x) return;
+
+    @autoreleasepool {
+        size_t sizeDim = (size_t)K * sizeof(float);
+        size_t sizeQ = (size_t)Nq * sizeof(float);
+        size_t sizeK = (size_t)Nk * sizeof(float);
+        size_t sizeV = (size_t)Nv * sizeof(float);
+
+        id<MTLBuffer> bufXnorm = pool_get_buffer(sizeDim);
+        id<MTLBuffer> bufQ = pool_get_buffer(sizeQ);
+        id<MTLBuffer> bufK = pool_get_buffer(sizeK);
+        id<MTLBuffer> bufV = pool_get_buffer(sizeV);
+
+        if (!bufXnorm || !bufQ || !bufK || !bufV) {
+            pool_release_buffer(bufXnorm);
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+            pool_release_buffer(bufV);
+            return;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        encode_norm_qkv_steps(cmdBuffer, bufXnorm, bufQ, bufK, bufV,
+                              K, norm_weight, eps,
+                              wq_bf16, Nq, wk_bf16, Nk, wv_bf16, Nv);
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        memcpy(q_out, [bufQ contents], sizeQ);
+        memcpy(k_out, [bufK contents], sizeK);
+        memcpy(v_out, [bufV contents], sizeV);
+
+        pool_release_buffer(bufXnorm);
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+    }
+}
+
+void vox_metal_decoder_wo_ffn_next_qkv(int dim, int q_dim, int hidden,
+                                         const float *attn_out,
+                                         const uint16_t *wo_bf16,
+                                         const float *ffn_norm, float eps,
+                                         const float *ada_scale,
+                                         const uint16_t *w1_bf16,
+                                         const uint16_t *w3_bf16,
+                                         const uint16_t *w2_bf16,
+                                         const float *next_attn_norm,
+                                         const uint16_t *next_wq_bf16, int next_Nq,
+                                         const uint16_t *next_wk_bf16, int next_Nk,
+                                         const uint16_t *next_wv_bf16, int next_Nv,
+                                         float *q_out, float *k_out, float *v_out) {
+    if (!g_initialized || !g_shaders_initialized || !g_dec_x) return;
+
+    @autoreleasepool {
+        size_t sizeAttn = (size_t)q_dim * sizeof(float);
+        size_t sizeDim = (size_t)dim * sizeof(float);
+        size_t sizeHidden = (size_t)hidden * sizeof(float);
+        size_t sizeQ = (size_t)next_Nq * sizeof(float);
+        size_t sizeK = (size_t)next_Nk * sizeof(float);
+        size_t sizeV = (size_t)next_Nv * sizeof(float);
+
+        /* Scratch buffers */
+        id<MTLBuffer> bufAttn = pool_get_buffer(sizeAttn);
+        if (bufAttn) memcpy([bufAttn contents], attn_out, sizeAttn);
+        id<MTLBuffer> bufProj = pool_get_buffer(sizeDim);
+        id<MTLBuffer> bufXnorm = pool_get_buffer(sizeDim);
+        id<MTLBuffer> bufGate = pool_get_buffer(sizeHidden);
+        id<MTLBuffer> bufUp = pool_get_buffer(sizeHidden);
+        id<MTLBuffer> bufFfnOut = pool_get_buffer(sizeDim);
+        id<MTLBuffer> bufQ = pool_get_buffer(sizeQ);
+        id<MTLBuffer> bufK = pool_get_buffer(sizeK);
+        id<MTLBuffer> bufV = pool_get_buffer(sizeV);
+
+        if (!bufAttn || !bufProj || !bufXnorm || !bufGate || !bufUp ||
+            !bufFfnOut || !bufQ || !bufK || !bufV) {
+            pool_release_buffer(bufAttn);
+            pool_release_buffer(bufProj);
+            pool_release_buffer(bufXnorm);
+            pool_release_buffer(bufGate);
+            pool_release_buffer(bufUp);
+            pool_release_buffer(bufFfnOut);
+            pool_release_buffer(bufQ);
+            pool_release_buffer(bufK);
+            pool_release_buffer(bufV);
+            return;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+
+        /* Steps 1-10: wo + FFN (updates g_dec_x) */
+        encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                            bufGate, bufUp, bufFfnOut,
+                            dim, q_dim, hidden,
+                            wo_bf16, ffn_norm, eps, ada_scale,
+                            w1_bf16, w3_bf16, w2_bf16);
+
+        /* Steps 11-14: norm + QKV for next layer (reads updated g_dec_x) */
+        encode_norm_qkv_steps(cmdBuffer, bufXnorm, bufQ, bufK, bufV,
+                              dim, next_attn_norm, eps,
+                              next_wq_bf16, next_Nq,
+                              next_wk_bf16, next_Nk,
+                              next_wv_bf16, next_Nv);
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        memcpy(q_out, [bufQ contents], sizeQ);
+        memcpy(k_out, [bufK contents], sizeK);
+        memcpy(v_out, [bufV contents], sizeV);
+
+        pool_release_buffer(bufAttn);
+        pool_release_buffer(bufProj);
+        pool_release_buffer(bufXnorm);
+        pool_release_buffer(bufGate);
+        pool_release_buffer(bufUp);
+        pool_release_buffer(bufFfnOut);
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+    }
+}
+
+int vox_metal_decoder_wo_ffn_logits(int dim, int q_dim, int hidden, int vocab_size,
+                                      const float *attn_out,
+                                      const uint16_t *wo_bf16,
+                                      const float *ffn_norm, float eps,
+                                      const float *ada_scale,
+                                      const uint16_t *w1_bf16,
+                                      const uint16_t *w3_bf16,
+                                      const uint16_t *w2_bf16,
+                                      const float *final_norm,
+                                      const uint16_t *tok_emb_bf16,
+                                      float *logits_out) {
+    if (!g_initialized || !g_shaders_initialized || !g_dec_x) return 0;
+
+    int result = 0;
+
+    @autoreleasepool {
+        size_t sizeAttn = (size_t)q_dim * sizeof(float);
+        size_t sizeDim = (size_t)dim * sizeof(float);
+        size_t sizeHidden = (size_t)hidden * sizeof(float);
+        size_t sizeLogits = (size_t)vocab_size * sizeof(float);
+
+        id<MTLBuffer> bufEmb = get_cached_bf16_as_f16_buffer(tok_emb_bf16,
+                                                               (size_t)vocab_size * dim);
+        id<MTLBuffer> bufFinalNorm = get_cached_weight_buffer(final_norm, sizeDim);
+
+        /* Scratch buffers */
+        id<MTLBuffer> bufAttn = pool_get_buffer(sizeAttn);
+        if (bufAttn) memcpy([bufAttn contents], attn_out, sizeAttn);
+        id<MTLBuffer> bufProj = pool_get_buffer(sizeDim);
+        id<MTLBuffer> bufXnorm = pool_get_buffer(sizeDim);
+        id<MTLBuffer> bufGate = pool_get_buffer(sizeHidden);
+        id<MTLBuffer> bufUp = pool_get_buffer(sizeHidden);
+        id<MTLBuffer> bufFfnOut = pool_get_buffer(sizeDim);
+        id<MTLBuffer> bufLogits = pool_get_buffer(sizeLogits);
+        id<MTLBuffer> bufArgmax = pool_get_buffer(sizeof(int));
+
+        if (!bufAttn || !bufProj || !bufXnorm || !bufGate || !bufUp ||
+            !bufFfnOut || !bufLogits || !bufArgmax || !bufEmb || !bufFinalNorm) {
+            pool_release_buffer(bufAttn);
+            pool_release_buffer(bufProj);
+            pool_release_buffer(bufXnorm);
+            pool_release_buffer(bufGate);
+            pool_release_buffer(bufUp);
+            pool_release_buffer(bufFfnOut);
+            pool_release_buffer(bufLogits);
+            pool_release_buffer(bufArgmax);
+            return 0;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+
+        /* Steps 1-10: wo + FFN (updates g_dec_x) */
+        encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                            bufGate, bufUp, bufFfnOut,
+                            dim, q_dim, hidden,
+                            wo_bf16, ffn_norm, eps, ada_scale,
+                            w1_bf16, w3_bf16, w2_bf16);
+
+        /* Step 11: final rms_norm(g_dec_x, final_norm) → bufXnorm */
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+            [enc setComputePipelineState:g_rms_norm_pipeline];
+            [enc setBuffer:g_dec_x offset:0 atIndex:0];
+            [enc setBuffer:bufFinalNorm offset:0 atIndex:1];
+            [enc setBuffer:bufXnorm offset:0 atIndex:2];
+            [enc setBytes:&dim length:sizeof(int) atIndex:3];
+            [enc setBytes:&eps length:sizeof(float) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        /* Step 12: logits = x_norm @ tok_emb^T */
+        {
+            MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:1 columns:dim
+                                rowBytes:dim * sizeof(float)
+                                dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:vocab_size columns:dim
+                                rowBytes:dim * sizeof(uint16_t)
+                                dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:1 columns:vocab_size
+                                rowBytes:vocab_size * sizeof(float)
+                                dataType:MPSDataTypeFloat32];
+            MPSMatrix *matIn = [[MPSMatrix alloc] initWithBuffer:bufXnorm descriptor:descIn];
+            MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufEmb descriptor:descW];
+            MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufLogits descriptor:descOut];
+            MPSMatrixMultiplication *mm =
+                get_cached_matmul_op(NO, YES, 1, vocab_size, dim, 1.0, 0.0);
+            if (mm)
+                [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matIn rightMatrix:matW resultMatrix:matOut];
+        }
+
+        /* Step 13: argmax on GPU */
+        {
+            id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+            [enc setComputePipelineState:g_argmax_pipeline];
+            [enc setBuffer:bufLogits offset:0 atIndex:0];
+            [enc setBuffer:bufArgmax offset:0 atIndex:1];
+            [enc setBytes:&vocab_size length:sizeof(int) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+        }
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        result = ((int *)[bufArgmax contents])[0];
+
+        if (logits_out)
+            memcpy(logits_out, [bufLogits contents], sizeLogits);
+
+        pool_release_buffer(bufAttn);
+        pool_release_buffer(bufProj);
+        pool_release_buffer(bufXnorm);
+        pool_release_buffer(bufGate);
+        pool_release_buffer(bufUp);
+        pool_release_buffer(bufFfnOut);
+        pool_release_buffer(bufLogits);
+        pool_release_buffer(bufArgmax);
+    }
+
+    return result;
 }
 
 /* ========================================================================

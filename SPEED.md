@@ -37,7 +37,17 @@
 - Command buffers per token: 79 → 53 (26×2 per layer + 1 logits)
 - New shaders: ada_scale_mul, argmax_f32
 
-### Next target: Cross-layer fusion
-- Keep x on GPU across layers, fuse wo_ffn[i] + norm_qkv[i+1] in 1 cmd buf
-- Would reduce 53 → 27 cmd bufs per token (saves ~26 × 0.3ms ≈ 8ms)
-- Estimated: 38 → ~30 ms/step
+### Attempt 2: Cross-layer fusion — persistent GPU x (SUCCESS)
+- Keep x on GPU buffer across all 26 layers (no CPU round-trip between layers)
+- Fuse wo_ffn[i] + norm_qkv[i+1] into a single command buffer
+- Helper functions: encode_wo_ffn_steps(), encode_norm_qkv_steps()
+- New API: decoder_start/end, decoder_norm_qkv, decoder_wo_ffn_next_qkv, decoder_wo_ffn_logits
+- Command buffers per token: 53 → 27 (1 + 25 fused + 1 final)
+- **Result: 38 → 32.5 ms/step (test_speech), 39 → 35.7 ms/step (jfk)**
+- **Cumulative from baseline: 43.2 → 32.5 ms/step (25% faster)**
+
+### Next targets
+- Theoretical floor: ~23 ms (300 GB/s, 6.9 GB weights)
+- Remaining: 27 cmd bufs × ~0.3ms = ~8ms overhead
+- Gap: 32.5 - 23 = 9.5ms (some is cmd buf overhead, some is GPU compute overhead)
+- Ideas: GPU RoPE + GPU attention → fuse entire layer into 1 cmd buf (27 → 1)
