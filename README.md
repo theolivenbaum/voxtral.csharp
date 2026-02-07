@@ -2,7 +2,7 @@
 
 This is a C implementation of the inference pipeline for the [Mistral AI's Voxtral Realtime 4B model](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602). It has zero external dependencies beyond the C standard library. The MPS inference is decently fast, while the BLAS acceleration is usable but slow (it continuously convert the bf16 weights to fp32).
 
-Audio processing uses a chunked encoder with overlapping windows, bounding memory usage regardless of input length. Audio can also be piped from stdin (`--stdin`), making it easy to transcode and transcribe any format via ffmpeg. A streaming C API (`vox_stream_t`) lets you feed audio incrementally and receive token strings as they become available.
+Audio processing uses a chunked encoder with overlapping windows, bounding memory usage regardless of input length. Audio can also be piped from stdin (`--stdin`), or captured live from the microphone (`--from-mic`, macOS), making it easy to transcode and transcribe any format via ffmpeg. A streaming C API (`vox_stream_t`) lets you feed audio incrementally and receive token strings as they become available.
 
 **More testing needed:** please note that this project was mostly tested against few samples, and likely requires some more work to be production quality. However the hard part, to understand the model inference and reproduce the inference pipeline, is here, so the rest likely can be done easily. Testing it against very long transcriptions, able to stress the KV cache circular buffer, will be a useful task.
 
@@ -24,6 +24,9 @@ make mps       # Apple Silicon (fastest)
 
 # Transcribe audio (tokens stream to stdout as generated)
 ./voxtral -d voxtral-model -i audio.wav
+
+# Live microphone transcription (macOS, Ctrl+C to stop)
+./voxtral -d voxtral-model --from-mic
 
 # Pipe any format via ffmpeg
 ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
@@ -54,6 +57,7 @@ This requires just PyTorch and a few standard libraries.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word.
 - **Streaming C API**: Feed audio incrementally, get token strings back as they become available.
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors, loading is near-instant.
+- **Live microphone input**: `--from-mic` captures and transcribes from the default microphone (macOS) with automatic silence detection.
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Chunked encoder**: Processes audio in overlapping chunks, bounding memory regardless of length.
 - **Rolling KV cache**: Decoder KV cache is automatically compacted when it exceeds the sliding window (8192 positions), capping memory usage and allowing unlimited-length audio.
@@ -113,7 +117,19 @@ ffmpeg -i podcast.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 cat recording.wav | ./voxtral -d voxtral-model --stdin
 ```
 
-`--stdin` and `-i` are mutually exclusive.
+### Live Microphone Input
+
+The **`--from-mic` flag** captures audio from the default microphone (macOS only, uses AudioQueue Services). Press Ctrl+C to stop. Silence is automatically detected and stripped to reduce encoder/decoder work when you pause speaking — only actual speech is processed.
+
+```bash
+./voxtral -d voxtral-model --from-mic                # default 2s processing interval
+./voxtral -d voxtral-model --from-mic -I 1.0          # lower latency
+./voxtral -d voxtral-model --from-mic --silent         # no stderr status
+```
+
+If the model falls behind real-time, a warning is printed and audio is skipped to catch up.
+
+`--from-mic`, `--stdin`, and `-i` are mutually exclusive.
 
 To convert files to WAV format, just use `ffmpeg`:
 
@@ -188,6 +204,8 @@ vox_stream_free(s);
 ```
 
 `feed()` runs the mel spectrogram, encoder, and decoder on available data, queuing output tokens. `finish()` adds padding and processes remaining audio. `get()` retrieves pending tokens — call it after each `feed()` or whenever convenient. Token string pointers returned by `vox_stream_get()` are valid until `vox_stream_free()`.
+
+`vox_stream_flush(s)` forces the encoder to process whatever audio is buffered, regardless of the processing interval, and feeds right-padding so the decoder emits tokens that are behind the delay window. Unlike `finish()`, the stream stays open — you can continue feeding audio afterwards. This is useful for silence detection: when the speaker pauses, flush to get the pending transcription without ending the stream.
 
 Use `vox_set_processing_interval(s, seconds)` to control the latency/efficiency tradeoff (equivalent to `-I` on the CLI). When set, `feed()` accumulates audio but only runs the encoder/decoder after at least the specified duration of new audio has been fed. Lower values give more responsive streaming (text appears sooner), higher values batch more audio per encoder call for better GPU utilization. Default is 2.0 seconds. See the `-I` flag documentation above for guidance on choosing values.
 

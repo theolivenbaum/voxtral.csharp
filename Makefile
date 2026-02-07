@@ -46,11 +46,13 @@ endif
 # Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
+SRCS += voxtral_mic_macos.c
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-blas: LDFLAGS += -framework Accelerate
+blas: LDFLAGS += -framework Accelerate -framework AudioToolbox -framework CoreFoundation
 else
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 blas: LDFLAGS += -lopenblas
+SRCS += voxtral_mic_macos.c
 endif
 blas: clean $(TARGET)
 	@echo ""
@@ -63,7 +65,7 @@ ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
 MPS_OBJCFLAGS = $(MPS_CFLAGS) -fobjc-arc
-MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation
+MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation -framework AudioToolbox -framework CoreFoundation
 
 mps: clean mps-build
 	@echo ""
@@ -151,5 +153,6 @@ voxtral_encoder.o: voxtral_encoder.c voxtral.h voxtral_kernels.h voxtral_safeten
 voxtral_decoder.o: voxtral_decoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
 voxtral_tokenizer.o: voxtral_tokenizer.c voxtral_tokenizer.h
 voxtral_safetensors.o: voxtral_safetensors.c voxtral_safetensors.h
-main.o: main.c voxtral.h voxtral_kernels.h
+main.o: main.c voxtral.h voxtral_kernels.h voxtral_mic.h
+voxtral_mic_macos.o: voxtral_mic_macos.c voxtral_mic.h
 inspect_weights.o: inspect_weights.c voxtral_safetensors.h

@@ -272,6 +272,10 @@ int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
  * finish() always processes all remaining data regardless. */
 void vox_set_processing_interval(vox_stream_t *s, float seconds);
 
+/* Force the encoder to process whatever audio is buffered, regardless of the
+ * processing interval. Useful for flushing on silence detection. */
+int vox_stream_flush(vox_stream_t *s);
+
 /* Free streaming context and all resources. */
 void vox_stream_free(vox_stream_t *s);
 

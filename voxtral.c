@@ -979,34 +979,18 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples) {
 
 int vox_stream_finish(vox_stream_t *s) {
     if (!s || s->finished) return -1;
+
+    /* Flush with right padding (shared with vox_stream_flush) */
+    vox_stream_flush(s);
+
     s->finished = 1;
-
-    int n_delay_tokens = s->ctx->delay_tokens;
-
-    /* Right padding: align + buffer tokens */
-    int align_pad = (RAW_AUDIO_LENGTH_PER_TOK -
-        (s->real_samples_fed % RAW_AUDIO_LENGTH_PER_TOK)) % RAW_AUDIO_LENGTH_PER_TOK;
-    int n_right_pad_tokens = (n_delay_tokens + 1) + OFFLINE_STREAMING_BUFFER_TOKENS;
-    int right_pad = align_pad + n_right_pad_tokens * RAW_AUDIO_LENGTH_PER_TOK;
-
-    /* Feed right padding zeros */
-    float zero_buf[4096];
-    memset(zero_buf, 0, sizeof(zero_buf));
-    int remaining = right_pad;
-    while (remaining > 0) {
-        int chunk = remaining > 4096 ? 4096 : remaining;
-        vox_mel_feed(s->mel_ctx, zero_buf, chunk);
-        remaining -= chunk;
-    }
-
-    /* Finalize mel */
     vox_mel_finish(s->mel_ctx, 0);
 
     if (vox_verbose >= 2)
         fprintf(stderr, "Stream finished: %d real samples (%.1f sec)\n",
                 s->real_samples_fed, (float)s->real_samples_fed / VOX_SAMPLE_RATE);
 
-    /* Process remaining encoder chunks and generate remaining tokens */
+    /* Final pass after mel finalization */
     stream_run_encoder(s);
     stream_run_decoder(s);
     return 0;
@@ -1331,6 +1315,35 @@ char *vox_transcribe(vox_ctx_t *ctx, const char *wav_path) {
     char *text = vox_transcribe_audio(ctx, samples, n_samples);
     free(samples);
     return text;
+}
+
+int vox_stream_flush(vox_stream_t *s) {
+    if (!s || s->finished) return -1;
+
+    /* Feed the same right padding that finish() uses, so the decoder can
+     * push out tokens that are behind the delay window. */
+    int n_delay_tokens = s->ctx->delay_tokens;
+    int align_pad = (RAW_AUDIO_LENGTH_PER_TOK -
+        (s->real_samples_fed % RAW_AUDIO_LENGTH_PER_TOK)) % RAW_AUDIO_LENGTH_PER_TOK;
+    int n_right_pad_tokens = (n_delay_tokens + 1) + OFFLINE_STREAMING_BUFFER_TOKENS;
+    int right_pad = align_pad + n_right_pad_tokens * RAW_AUDIO_LENGTH_PER_TOK;
+
+    float zero_buf[4096];
+    memset(zero_buf, 0, sizeof(zero_buf));
+    int remaining = right_pad;
+    while (remaining > 0) {
+        int chunk = remaining > 4096 ? 4096 : remaining;
+        vox_mel_feed(s->mel_ctx, zero_buf, chunk);
+        remaining -= chunk;
+    }
+
+    /* Force encoder to process all buffered mel, then run decoder */
+    int saved = s->min_new_mel;
+    s->min_new_mel = 1;
+    stream_run_encoder(s);
+    stream_run_decoder(s);
+    s->min_new_mel = saved;
+    return 0;
 }
 
 void vox_set_processing_interval(vox_stream_t *s, float seconds) {
