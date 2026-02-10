@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Voxtral\Voxtral.csproj" />
+    <ProjectReference Include="..\Voxtral.Onnx\Voxtral.Onnx.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
