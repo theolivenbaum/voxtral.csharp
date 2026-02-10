@@ -39,17 +39,38 @@ namespace Voxtral
 
         public Tensor<float> ComputeMelSpectrogram(float[] audio)
         {
+            // Center padding for STFT (reflect padding of size N_FFT / 2 = 200)
+            int pad = WINDOW_SIZE / 2;
+            float[] paddedAudio = new float[audio.Length + 2 * pad];
+
+            // Reflect left
+            for (int i = 0; i < pad; i++)
+            {
+                int srcIdx = pad - 1 - i;
+                paddedAudio[i] = (srcIdx < audio.Length) ? audio[srcIdx] : 0;
+            }
+
+            // Copy center
+            Array.Copy(audio, 0, paddedAudio, pad, audio.Length);
+
+            // Reflect right
+            for (int i = 0; i < pad; i++)
+            {
+                int srcIdx = audio.Length - 2 - i;
+                paddedAudio[pad + audio.Length + i] = (srcIdx >= 0) ? audio[srcIdx] : 0;
+            }
+
             // STFT
-            // audio is padded.
             // Number of frames:
-            int nFrames = (audio.Length - WINDOW_SIZE) / HOP_LENGTH + 1;
+            int nFrames = (paddedAudio.Length - WINDOW_SIZE) / HOP_LENGTH + 1;
+            // Reference drops the last frame: magnitudes = stft[..., :-1]
+            nFrames -= 1;
 
             int numFreqBins = WINDOW_SIZE / 2 + 1; // 201
 
             float[,] magnitudes = new float[nFrames, numFreqBins];
 
             // Perform STFT
-            // Using naive DFT for 400 points
             for (int i = 0; i < nFrames; i++)
             {
                 int start = i * HOP_LENGTH;
@@ -58,8 +79,8 @@ namespace Voxtral
                 // Apply window
                 for (int j = 0; j < WINDOW_SIZE; j++)
                 {
-                    if (start + j < audio.Length)
-                        frame[j] = audio[start + j] * _hannWindow[j];
+                    if (start + j < paddedAudio.Length)
+                        frame[j] = paddedAudio[start + j] * _hannWindow[j];
                     else
                         frame[j] = 0;
                 }
@@ -73,18 +94,7 @@ namespace Voxtral
             }
 
             // Apply Mel Filterbank
-            // mel_spec = mel_filters.T @ magnitudes.T  (if filters are [freq, mel])
-            // In Python: mel_filters [201, 128]. magnitudes [201, frames] (after transpose of stft result)
-            // Python code: mel_spec = mel_filters.T @ magnitudes  -> [128, 201] @ [201, frames] -> [128, frames]
-
-            // Here magnitudes is [frames, 201].
-            // We want [128, frames] output?
-            // Tensor layout: [128, frames] usually (channels, time).
-
             float[] melSpecData = new float[NUM_MEL_BINS * nFrames];
-
-            // Matrix multiplication
-            // melSpec[m, t] = sum_f (melFilter[f, m] * magnitude[t, f])
 
             for (int t = 0; t < nFrames; t++)
             {
@@ -97,15 +107,12 @@ namespace Voxtral
                     }
 
                     // Log compression
-                    // log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-                    // log_spec = torch.maximum(log_spec, torch.tensor(GLOBAL_LOG_MEL_MAX) - 8.0)
-                    // log_spec = (log_spec + 4.0) / 4.0
-
                     float val = Math.Max(sum, 1e-10f);
                     float logVal = (float)Math.Log10(val);
                     logVal = Math.Max(logVal, GLOBAL_LOG_MEL_MAX - 8.0f);
                     logVal = (logVal + 4.0f) / 4.0f;
 
+                    // Output layout: [NUM_MEL_BINS, nFrames]
                     melSpecData[m * nFrames + t] = logVal;
                 }
             }
