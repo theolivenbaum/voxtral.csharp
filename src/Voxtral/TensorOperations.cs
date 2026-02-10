@@ -4,6 +4,7 @@ using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using System.Threading.Tasks;
 
 namespace Voxtral
 {
@@ -15,105 +16,187 @@ namespace Voxtral
             float sumSq = TensorPrimitives.SumOfSquares(x);
             float rms = 1.0f / MathF.Sqrt(sumSq / x.Length + eps);
 
-            TensorPrimitives.Multiply(x, w, y);
-            TensorPrimitives.Multiply(y, rms, y);
+            if (x.Length == w.Length && x.Length == y.Length)
+            {
+                int i = 0;
+                int len = x.Length;
+                int vectorSize = Vector<float>.Count;
+                int vectorLimit = len - (len % vectorSize);
+
+                for (; i < vectorLimit; i += vectorSize)
+                {
+                    Vector<float> vx = new Vector<float>(x.Slice(i));
+                    Vector<float> vw = new Vector<float>(w.Slice(i));
+                    Vector<float> vy = vx * vw * rms;
+                    vy.CopyTo(y.Slice(i));
+                }
+
+                for (; i < len; i++)
+                {
+                    y[i] = x[i] * w[i] * rms;
+                }
+            }
+            else
+            {
+                TensorPrimitives.Multiply(x, w, y);
+                TensorPrimitives.Multiply(y, rms, y);
+            }
         }
 
         public static void Softmax(Span<float> x)
         {
             float max = TensorPrimitives.Max(x);
-            float sum = 0;
-
-            for(int i=0; i<x.Length; i++)
-            {
-                float val = MathF.Exp(x[i] - max);
-                x[i] = val;
-                sum += val;
-            }
-
+            TensorPrimitives.Subtract(x, max, x);
+            TensorPrimitives.Exp(x, x);
+            float sum = TensorPrimitives.Sum(x);
             TensorPrimitives.Divide(x, sum, x);
         }
 
         public static void SiLU(ReadOnlySpan<float> x, Span<float> y)
         {
-            for(int i=0; i<x.Length; i++)
+            const int ChunkSize = 128;
+            Span<float> tmpX = stackalloc float[ChunkSize];
+            Span<float> tmpCalc = stackalloc float[ChunkSize];
+
+            int offset = 0;
+            while (offset < x.Length)
             {
-                float val = x[i];
-                y[i] = val / (1.0f + MathF.Exp(-val));
+                int count = Math.Min(ChunkSize, x.Length - offset);
+                var xChunk = x.Slice(offset, count);
+                var yChunk = y.Slice(offset, count);
+                var tX = tmpX.Slice(0, count);
+                var tCalc = tmpCalc.Slice(0, count);
+
+                xChunk.CopyTo(tX);
+                TensorPrimitives.Sigmoid(tX, tCalc);
+                TensorPrimitives.Multiply(tX, tCalc, yChunk);
+
+                offset += count;
             }
         }
 
         public static void Gelu(ReadOnlySpan<float> x, Span<float> y)
         {
-             // Tanh approximation
              const float Sqrt2OverPi = 0.7978845608f;
              const float Coeff = 0.044715f;
+             const int ChunkSize = 128;
 
-             for(int i=0; i<x.Length; i++)
+             Span<float> tmpX = stackalloc float[ChunkSize];
+             Span<float> tmpCalc = stackalloc float[ChunkSize];
+
+             int offset = 0;
+             while (offset < x.Length)
              {
-                 float val = x[i];
-                 float inner = Sqrt2OverPi * (val + Coeff * val * val * val);
-                 y[i] = 0.5f * val * (1.0f + MathF.Tanh(inner));
+                 int count = Math.Min(ChunkSize, x.Length - offset);
+                 var xChunk = x.Slice(offset, count);
+                 var yChunk = y.Slice(offset, count);
+                 var tX = tmpX.Slice(0, count);
+                 var tCalc = tmpCalc.Slice(0, count);
+
+                 xChunk.CopyTo(tX);
+
+                 tX.CopyTo(tCalc);
+                 TensorPrimitives.Multiply(tCalc, tX, tCalc); // x^2
+                 TensorPrimitives.Multiply(tCalc, tX, tCalc); // x^3
+
+                 TensorPrimitives.Multiply(tCalc, Coeff, tCalc);
+                 TensorPrimitives.Add(tCalc, tX, tCalc);
+
+                 TensorPrimitives.Multiply(tCalc, Sqrt2OverPi, tCalc);
+                 TensorPrimitives.Tanh(tCalc, tCalc);
+
+                 TensorPrimitives.Add(tCalc, 1.0f, tCalc);
+                 TensorPrimitives.Multiply(tCalc, tX, tCalc);
+                 TensorPrimitives.Multiply(tCalc, 0.5f, yChunk);
+
+                 offset += count;
              }
         }
 
-        // y = x @ w.T + b
-        // x: [M, K], w: [N, K], b: [N], y: [M, N]
         public static void Linear(ReadOnlySpan<float> x, ReadOnlySpan<float> w, ReadOnlySpan<float> b, Span<float> y, int M, int N, int K)
         {
-            // Naive parallel implementation
-            // Parallelize over M (rows of x)
-
-            // For single-threaded simple implementation first
-            for (int i = 0; i < M; i++)
+            unsafe
             {
-                var rowX = x.Slice(i * K, K);
-                var rowY = y.Slice(i * N, N);
-
-                for (int j = 0; j < N; j++)
+                fixed (float* px = x)
+                fixed (float* pw = w)
+                fixed (float* pb = b)
+                fixed (float* py = y)
                 {
-                    var rowW = w.Slice(j * K, K);
-                    float dot = TensorPrimitives.Dot(rowX, rowW);
+                    nint ptrX = (nint)px;
+                    nint ptrW = (nint)pw;
+                    nint ptrB = (nint)pb;
+                    nint ptrY = (nint)py;
 
-                    if (!b.IsEmpty)
+                    int bLen = b.Length; // Capture length
+
+                    Parallel.For(0, M, i =>
                     {
-                        dot += b[j];
-                    }
-                    rowY[j] = dot;
+                        float* pXLocal = (float*)ptrX;
+                        float* pWLocal = (float*)ptrW;
+                        float* pBLocal = (float*)ptrB;
+                        float* pYLocal = (float*)ptrY;
+
+                        ReadOnlySpan<float> rowX = new ReadOnlySpan<float>(pXLocal + i * K, K);
+                        // RowY starts at pYLocal + i * N
+
+                        for (int j = 0; j < N; j++)
+                        {
+                            ReadOnlySpan<float> rowW = new ReadOnlySpan<float>(pWLocal + j * K, K);
+
+                            float dot = TensorPrimitives.Dot(rowX, rowW);
+
+                            if (pBLocal != null && bLen > 0)
+                            {
+                                dot += pBLocal[j];
+                            }
+                            // Store result
+                            (pYLocal + i * N)[j] = dot;
+                        }
+                    });
                 }
             }
         }
 
-        // RoPE
-        // x: [seq, heads, head_dim]
-        // cos, sin: [seq, head_dim/2]
-        // Interleaved style: pairs (0,1), (2,3)
-        // x_out[i] = x[i] * cos[i/2] - x[i+1] * sin[i/2]
-        // x_out[i+1] = x[i+1] * cos[i/2] + x[i] * sin[i/2]
         public static void ApplyRoPE(Span<float> x, ReadOnlySpan<float> cos, ReadOnlySpan<float> sin, int seqLen, int nHeads, int headDim)
         {
             int halfDim = headDim / 2;
 
-            for (int s = 0; s < seqLen; s++)
+            unsafe
             {
-                var cosRow = cos.Slice(s * halfDim, halfDim);
-                var sinRow = sin.Slice(s * halfDim, halfDim);
-
-                for (int h = 0; h < nHeads; h++)
+                fixed (float* px = x)
+                fixed (float* pCos = cos)
+                fixed (float* pSin = sin)
                 {
-                    int offset = (s * nHeads + h) * headDim;
-                    var head = x.Slice(offset, headDim);
+                    nint ptrX = (nint)px;
+                    nint ptrCos = (nint)pCos;
+                    nint ptrSin = (nint)pSin;
 
-                    for (int i = 0; i < halfDim; i++)
+                    Parallel.For(0, seqLen, s =>
                     {
-                        float val0 = head[2 * i];
-                        float val1 = head[2 * i + 1];
-                        float c = cosRow[i];
-                        float sn = sinRow[i];
+                        float* pXLocal = (float*)ptrX;
+                        float* pCosLocal = (float*)ptrCos;
+                        float* pSinLocal = (float*)ptrSin;
 
-                        head[2 * i] = val0 * c - val1 * sn;
-                        head[2 * i + 1] = val1 * c + val0 * sn;
-                    }
+                        ReadOnlySpan<float> cosRow = new ReadOnlySpan<float>(pCosLocal + s * halfDim, halfDim);
+                        ReadOnlySpan<float> sinRow = new ReadOnlySpan<float>(pSinLocal + s * halfDim, halfDim);
+
+                        for (int h = 0; h < nHeads; h++)
+                        {
+                            int offset = (s * nHeads + h) * headDim;
+                            float* pHead = pXLocal + offset;
+
+                            for (int i = 0; i < halfDim; i++)
+                            {
+                                float val0 = pHead[2 * i];
+                                float val1 = pHead[2 * i + 1];
+                                float c = cosRow[i];
+                                float sn = sinRow[i];
+
+                                pHead[2 * i] = val0 * c - val1 * sn;
+                                pHead[2 * i + 1] = val1 * c + val0 * sn;
+                            }
+                        }
+                    });
                 }
             }
         }
