@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Voxtral\Voxtral.csproj" />
     <ProjectReference Include="..\Voxtral.Onnx\Voxtral.Onnx.csproj" />
+    <ProjectReference Include="..\Voxtral.Onnx.Gpu\Voxtral.Onnx.Gpu.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

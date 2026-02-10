@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using Voxtral;
 using Voxtral.Onnx;
+using Voxtral.Onnx.Gpu;
 
 namespace Voxtral.CLI
 {
@@ -31,7 +32,7 @@ namespace Voxtral.CLI
 
             if (string.IsNullOrEmpty(inputFile))
             {
-                Console.WriteLine("Usage: voxtral -d <model_dir> -i <input.wav> [--backend <dotnet|onnx>]");
+                Console.WriteLine("Usage: voxtral -d <model_dir> -i <input.wav> [--backend <dotnet|onnx|onnx-gpu>]");
                 return;
             }
 
@@ -55,6 +56,10 @@ namespace Voxtral.CLI
                 if (backend == "onnx")
                 {
                     model = new VoxtralOnnxModel(modelDir);
+                }
+                else if (backend == "onnx-gpu")
+                {
+                    model = new VoxtralOnnxGpuModel(modelDir);
                 }
                 else
                 {
