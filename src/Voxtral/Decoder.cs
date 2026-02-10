@@ -100,6 +100,7 @@ namespace Voxtral
         private const float NORM_EPS = 1e-5f;
         private const float ROPE_THETA = 1000000.0f;
 
+        private readonly float[] _ropeFreqs;
         private readonly float[] _attnNorm, _ffnNorm;
         private readonly float[] _wq, _wk, _wv, _wo;
         private readonly float[] _w1, _w2, _w3;
@@ -111,6 +112,14 @@ namespace Voxtral
 
         public DecoderLayer(SafetensorsReader reader, int layerIdx)
         {
+            // Precompute RoPE frequencies
+            int halfDim = HEAD_DIM / 2;
+            _ropeFreqs = new float[halfDim];
+            for (int i = 0; i < halfDim; i++)
+            {
+                _ropeFreqs[i] = 1.0f / MathF.Pow(ROPE_THETA, 2.0f * i / HEAD_DIM);
+            }
+
             string p = $"layers.{layerIdx}";
 
             _attnNorm = reader.LoadTensor($"{p}.attention_norm.weight").ToArray();
@@ -155,8 +164,13 @@ namespace Voxtral
             TensorOperations.Linear(xNorm, _wv, ReadOnlySpan<float>.Empty, v, seqLen, kvDim, DIM);
 
             // RoPE
-            float[] cos, sin;
-            ComputeRope(pos, seqLen, out cos, out sin);
+            int halfDim = HEAD_DIM / 2;
+            int ropeSize = seqLen * halfDim;
+            // Use stackalloc for small sequences to avoid allocations
+            Span<float> cos = ropeSize <= 4096 ? stackalloc float[ropeSize] : new float[ropeSize];
+            Span<float> sin = ropeSize <= 4096 ? stackalloc float[ropeSize] : new float[ropeSize];
+
+            ComputeRope(pos, seqLen, cos, sin);
 
             TensorOperations.ApplyRoPE(q, cos, sin, seqLen, HEADS, HEAD_DIM);
             TensorOperations.ApplyRoPE(k, cos, sin, seqLen, KV_HEADS, HEAD_DIM);
@@ -215,19 +229,16 @@ namespace Voxtral
             TensorPrimitives.Add(h, projOut, h);
         }
 
-        private void ComputeRope(int pos, int seqLen, out float[] cos, out float[] sin)
+        private void ComputeRope(int pos, int seqLen, Span<float> cos, Span<float> sin)
         {
             int halfDim = HEAD_DIM / 2;
-            cos = new float[seqLen * halfDim];
-            sin = new float[seqLen * halfDim];
 
             for (int s = 0; s < seqLen; s++)
             {
                 int absPos = pos + s;
                 for (int i = 0; i < halfDim; i++)
                 {
-                    float freq = 1.0f / MathF.Pow(ROPE_THETA, 2.0f * i / HEAD_DIM);
-                    float angle = absPos * freq;
+                    float angle = absPos * _ropeFreqs[i];
                     cos[s * halfDim + i] = MathF.Cos(angle);
                     sin[s * halfDim + i] = MathF.Sin(angle);
                 }
@@ -256,19 +267,29 @@ namespace Voxtral
             int dim = HEAD_DIM;
             float scale = 1.0f / MathF.Sqrt(dim);
 
-            for (int h = 0; h < qHeads; h++)
+            Parallel.For(0, qHeads, h =>
             {
                 int kvH = h / gqaRatio;
 
                 for (int s = 0; s < seqLen; s++)
                 {
                     int absPos = pos + s;
+                    // Note: accessing q and output slices is thread-safe as they are distinct for each h
+                    // Need to be careful with Span in lambda?
+                    // Span cannot be captured in lambda if lambda is closure over local span.
+                    // But q and output are arrays. We slice them inside the lambda. This is safe.
+
                     var qi = q.AsSpan((s * qHeads + h) * dim, dim);
 
                     int startP = Math.Max(0, absPos - WINDOW + 1);
                     int endP = absPos;
                     int len = endP - startP + 1;
 
+                    // Allocate scores on stack if small?
+                    // len <= WINDOW (8192). 32KB.
+                    // Stackalloc in loop inside Parallel.For is dangerous if recursion or many iterations?
+                    // But here seqLen is small.
+                    // Use array for safety.
                     float[] scores = new float[len];
 
                     for (int j = 0; j < len; j++)
@@ -298,7 +319,7 @@ namespace Voxtral
                         }
                     }
                 }
-            }
+            });
         }
     }
 }
