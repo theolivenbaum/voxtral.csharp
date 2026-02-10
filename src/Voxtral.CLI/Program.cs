@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using Voxtral;
+using Voxtral.Onnx;
 
 namespace Voxtral.CLI
 {
@@ -10,6 +11,7 @@ namespace Voxtral.CLI
         {
             string modelDir = "voxtral-model";
             string inputFile = null;
+            string backend = "dotnet";
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -21,11 +23,15 @@ namespace Voxtral.CLI
                 {
                     if (i + 1 < args.Length) inputFile = args[++i];
                 }
+                else if (args[i] == "--backend" || args[i] == "-b")
+                {
+                    if (i + 1 < args.Length) backend = args[++i].ToLower();
+                }
             }
 
             if (string.IsNullOrEmpty(inputFile))
             {
-                Console.WriteLine("Usage: voxtral -d <model_dir> -i <input.wav>");
+                Console.WriteLine("Usage: voxtral -d <model_dir> -i <input.wav> [--backend <dotnet|onnx>]");
                 return;
             }
 
@@ -43,14 +49,26 @@ namespace Voxtral.CLI
 
             try
             {
-                Console.WriteLine($"Loading model from {modelDir}...");
-                using var model = new VoxtralModel(modelDir);
+                Console.WriteLine($"Loading model from {modelDir} (Backend: {backend})...");
 
-                Console.WriteLine($"Transcribing {inputFile}...");
-                string text = model.Transcribe(inputFile);
+                IVoxtralModel model;
+                if (backend == "onnx")
+                {
+                    model = new VoxtralOnnxModel(modelDir);
+                }
+                else
+                {
+                    model = new VoxtralModel(modelDir);
+                }
 
-                Console.WriteLine("\nFinal Result:");
-                Console.WriteLine(text);
+                using (model)
+                {
+                    Console.WriteLine($"Transcribing {inputFile}...");
+                    string text = model.Transcribe(inputFile);
+
+                    Console.WriteLine("\nFinal Result:");
+                    Console.WriteLine(text);
+                }
             }
             catch (Exception ex)
             {

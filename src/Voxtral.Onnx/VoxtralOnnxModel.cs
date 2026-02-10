@@ -2,34 +2,34 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Numerics.Tensors;
 using System.Text;
+using Microsoft.ML.OnnxRuntime.Tensors;
 
-namespace Voxtral
+namespace Voxtral.Onnx
 {
-    public class VoxtralModel : IVoxtralModel
+    public class VoxtralOnnxModel : IVoxtralModel
     {
-        private SafetensorsReader _reader;
-        private Encoder _encoder;
-        private Adapter _adapter;
-        private Decoder _decoder;
+        private OnnxSafetensorsReader _reader;
+        private OnnxEncoder _encoder;
+        private OnnxAdapter _adapter;
+        private OnnxDecoder _decoder;
         private Tokenizer _tokenizer;
 
-        public VoxtralModel(string modelDir)
+        public VoxtralOnnxModel(string modelDir)
         {
             var sw = Stopwatch.StartNew();
-            Console.WriteLine("Loading model...");
+            Console.WriteLine("Loading model (ONNX Backend)...");
             string safetensorsPath = Path.Combine(modelDir, "consolidated.safetensors");
-            _reader = new SafetensorsReader(safetensorsPath);
+            _reader = new OnnxSafetensorsReader(safetensorsPath);
 
-            _encoder = new Encoder(_reader);
+            _encoder = new OnnxEncoder(_reader);
             Console.WriteLine($"Loaded encoder in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            _adapter = new Adapter(_reader);
+            _adapter = new OnnxAdapter(_reader);
             Console.WriteLine($"Loaded reader in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            _decoder = new Decoder(_reader);
+            _decoder = new OnnxDecoder(_reader);
             Console.WriteLine($"Loaded decoder in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
             _tokenizer = new Tokenizer(modelDir);
-            Console.WriteLine($"Loaded tokenizer in {sw.Elapsed.TotalSeconds:n0}s..."); 
+            Console.WriteLine($"Loaded tokenizer in {sw.Elapsed.TotalSeconds:n0}s...");
         }
 
         public void Dispose()
@@ -42,7 +42,7 @@ namespace Voxtral
             // Audio
             var sw = Stopwatch.StartNew();
             Console.WriteLine("Processing audio...");
-            var processor = new AudioProcessor();
+            var processor = new OnnxAudioProcessor();
             var audio = processor.LoadAndPreprocessAudio(wavPath);
             var mel = processor.ComputeMelSpectrogram(audio);
             Console.WriteLine($"Loaded audio in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
@@ -59,7 +59,7 @@ namespace Voxtral
 
             // Decoder
             Console.WriteLine("Running Decoder...");
-            int nLeftPad = AudioProcessor.N_LEFT_PAD_TOKENS;
+            int nLeftPad = OnnxAudioProcessor.N_LEFT_PAD_TOKENS;
             int nDelay = 6;
 
             List<int> promptIds = new List<int> { 1 }; // BOS
@@ -71,15 +71,15 @@ namespace Voxtral
 
             // Combine embeddings
             float[] prefixEmbedsData = new float[L * 3072];
-            Tensor<float> prefixEmbeds = Tensor.Create(prefixEmbedsData, new nint[] { L, 3072 });
+            DenseTensor<float> prefixEmbeds = new DenseTensor<float>(prefixEmbedsData, new int[] { L, 3072 });
 
-            var prefixSpan = prefixEmbeds.AsSpan();
-            var adapterSpan = adapterOut.AsSpan();
+            var prefixSpan = prefixEmbeds.Buffer.Span;
+            var adapterSpan = adapterOut.Buffer.Span;
 
             for (int i = 0; i < L; i++)
             {
                 var txtEmb = _decoder.EmbedToken(promptIds[i]);
-                var txtEmbSpan = txtEmb.AsSpan();
+                var txtEmbSpan = txtEmb.Buffer.Span;
                 var audEmb = adapterSpan.Slice(i * 3072, 3072);
 
                 for (int j = 0; j < 3072; j++)
@@ -89,7 +89,7 @@ namespace Voxtral
             }
 
             // Time Cond
-            Tensor<float> tCond = Decoder.ComputeTimeEmbedding(nDelay, 3072);
+            DenseTensor<float> tCond = OnnxDecoder.ComputeTimeEmbedding(nDelay, 3072);
 
             // Prefill
             if (L > 1)
@@ -98,14 +98,14 @@ namespace Voxtral
                 // Copy from prefixEmbeds
                 prefixSpan.Slice(0, (L - 1) * 3072).CopyTo(prefillInputData);
 
-                Tensor<float> prefillInput = Tensor.Create(prefillInputData, new nint[] { L - 1, 3072 });
+                DenseTensor<float> prefillInput = new DenseTensor<float>(prefillInputData, new int[] { L - 1, 3072 });
                 _decoder.Prefill(prefillInput, tCond);
             }
 
             // Generate first token
             float[] lastEmbedData = new float[3072];
             prefixSpan.Slice((L - 1) * 3072, 3072).CopyTo(lastEmbedData);
-            Tensor<float> lastEmbed = Tensor.Create(lastEmbedData, new nint[] { 3072 });
+            DenseTensor<float> lastEmbed = new DenseTensor<float>(lastEmbedData, new int[] { 3072 });
 
             var logits = _decoder.ForwardOne(lastEmbed, L - 1, tCond);
             int token = ArgMax(logits);
@@ -120,7 +120,7 @@ namespace Voxtral
                 if (token == 2) break; // EOS
 
                 var txtEmb = _decoder.EmbedToken(token);
-                var txtEmbSpan = txtEmb.AsSpan();
+                var txtEmbSpan = txtEmb.Buffer.Span;
 
                 // adapterSpan is valid here (captured from adapterOut)
                 var audEmb = adapterSpan.Slice(pos * 3072, 3072);
@@ -129,7 +129,7 @@ namespace Voxtral
                 // Manual add
                 for (int j = 0; j < 3072; j++) embedData[j] = txtEmbSpan[j] + audEmb[j];
 
-                Tensor<float> embed = Tensor.Create(embedData, new nint[] { 3072 });
+                DenseTensor<float> embed = new DenseTensor<float>(embedData, new int[] { 3072 });
 
                 logits = _decoder.ForwardOne(embed, pos, tCond);
                 token = ArgMax(logits);
@@ -146,9 +146,9 @@ namespace Voxtral
             return result;
         }
 
-        private int ArgMax(Tensor<float> logits)
+        private int ArgMax(DenseTensor<float> logits)
         {
-            var span = logits.AsSpan();
+            var span = logits.Buffer.Span;
             float maxVal = float.NegativeInfinity;
             int maxIdx = -1;
             for (int i = 0; i < span.Length; i++)
