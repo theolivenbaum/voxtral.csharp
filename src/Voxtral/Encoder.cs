@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Numerics.Tensors;
 using System.Threading.Tasks;
 
@@ -97,7 +98,7 @@ namespace Voxtral
             float[] h0Data = new float[frames * 1280];
             Tensor<float> h0 = Tensor.Create(h0Data, new nint[] { 1280, frames });
 
-            ApplyConv1dInterleaved(mel.AsSpan(), _w0.AsSpan(), _b0.AsSpan(), h0.AsSpan(), 128, 1280, 3, 1, frames);
+            ApplyConv1dInterleaved(mel, _w0, _b0, h0, 128, 1280, 3, 1, frames);
 
             TensorOperations.Gelu(h0, h0);
 
@@ -106,7 +107,7 @@ namespace Voxtral
             float[] out1Data = new float[1280 * frames2];
             Tensor<float> out1 = Tensor.Create(out1Data, new nint[] { 1280, frames2 });
 
-            ApplyConv1dInterleaved(h0.AsSpan(), _w1.AsSpan(), _b1.AsSpan(), out1.AsSpan(), 1280, 1280, 3, 2, frames);
+            ApplyConv1dInterleaved(h0, _w1, _b1, out1, 1280, 1280, 3, 2, frames);
 
             TensorOperations.Gelu(out1, out1);
 
@@ -138,46 +139,48 @@ namespace Voxtral
             return outT;
         }
 
-        private unsafe void ApplyConv1dInterleaved(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, ReadOnlySpan<float> bias, Span<float> output,
+        private void ApplyConv1dInterleaved(Tensor<float> input, Tensor<float> weight, Tensor<float> bias, Tensor<float> output,
                                             int cIn, int cOut, int kSize, int stride, int len)
         {
             int paddingTotal = kSize - stride;
             int outLen = (len + paddingTotal - kSize) / stride + 1;
 
-            fixed (float* pInput = input)
-            fixed (float* pWeight = weight)
-            fixed (float* pBias = bias)
-            fixed (float* pOutput = output)
+            // Get strides for flat indexing
+            nint inStride = input.Lengths[1];
+            nint outStride = output.Lengths[1];
+
+            Parallel.For(0, cOut, o =>
             {
-                float* pIn = pInput;
-                float* pW = pWeight;
-                float* pB = pBias;
-                float* pOut = pOutput;
+                // Use flattened spans to avoid indexing issues with TensorSpan
+                var inSpan = input.AsSpan();
+                var wSpan = weight.AsSpan();
+                var bSpan = bias.AsSpan();
+                var outSpan = output.AsSpan();
 
-                Parallel.For(0, cOut, o =>
+                float b = bSpan[o];
+
+                for (int t = 0; t < outLen; t++)
                 {
-                    float b = pB[o];
+                    float sum = b;
 
-                    for (int t = 0; t < outLen; t++)
+                    for (int k = 0; k < kSize; k++)
                     {
-                        float sum = b;
+                        int inT = t * stride - paddingTotal + k;
 
-                        for (int k = 0; k < kSize; k++)
+                        if (inT >= 0 && inT < len)
                         {
-                            int inT = t * stride - paddingTotal + k;
-
-                            if (inT >= 0 && inT < len)
+                            for (int i = 0; i < cIn; i++)
                             {
-                                for (int i = 0; i < cIn; i++)
-                                {
-                                    sum += pIn[i * len + inT] * pW[o * cIn * kSize + i * kSize + k];
-                                }
+                                nint inputIdx = (nint)i * inStride + inT;
+                                nint weightIdx = (nint)o * cIn * kSize + (nint)i * kSize + k;
+
+                                sum += inSpan[(int)inputIdx] * wSpan[(int)weightIdx];
                             }
                         }
-                        pOut[o * outLen + t] = sum;
                     }
-                });
-            }
+                    outSpan[(int)((nint)o * outStride + t)] = sum;
+                }
+            });
         }
     }
 
@@ -282,53 +285,54 @@ namespace Voxtral
             TensorPrimitives.Add(hSpan, projOut.AsSpan(), hSpan);
         }
 
-        private unsafe void PerformAttention(Tensor<float> q, Tensor<float> k, Tensor<float> v, Tensor<float> output, int seqLen)
+        private void PerformAttention(Tensor<float> q, Tensor<float> k, Tensor<float> v, Tensor<float> output, int seqLen)
         {
             int window = 750;
             float scale = 1.0f / MathF.Sqrt(HEAD_DIM);
 
-            fixed (float* pQ = q.AsSpan())
-            fixed (float* pK = k.AsSpan())
-            fixed (float* pV = v.AsSpan())
-            fixed (float* pOut = output.AsSpan())
+            Parallel.For(0, HEADS, h =>
             {
-                float* ptrQ = pQ;
-                float* ptrK = pK;
-                float* ptrV = pV;
-                float* ptrOut = pOut;
+                var qSpan = q.AsSpan();
+                var kSpan = k.AsSpan();
+                var vSpan = v.AsSpan();
+                var outSpan = output.AsSpan();
 
-                Parallel.For(0, HEADS, h =>
+                for (int i = 0; i < seqLen; i++)
                 {
-                    for (int i = 0; i < seqLen; i++)
+                    nint qiOffset = ((nint)i * HEADS + h) * HEAD_DIM;
+                    var qi = qSpan.Slice((int)qiOffset, HEAD_DIM);
+                    TensorSpan<float> qiTs = new TensorSpan<float>(qi);
+
+                    int startJ = Math.Max(0, i - window + 1);
+                    int endJ = i;
+                    int len = endJ - startJ + 1;
+
+                    // Use ArrayPool to avoid allocations and stack overflow
+                    float[] scoresArray = ArrayPool<float>.Shared.Rent(len);
+                    Span<float> scores = scoresArray.AsSpan(0, len);
+
+                    try
                     {
-                        int qiOffset = (i * HEADS + h) * HEAD_DIM;
-                        var qi = new ReadOnlySpan<float>(ptrQ + qiOffset, HEAD_DIM);
-
-                        int startJ = Math.Max(0, i - window + 1);
-                        int endJ = i;
-                        int len = endJ - startJ + 1;
-
-                        float[] scores = new float[len];
-
                         for (int j = 0; j < len; j++)
                         {
                             int realJ = startJ + j;
-                            int kjOffset = (realJ * HEADS + h) * HEAD_DIM;
-                            var kj = new ReadOnlySpan<float>(ptrK + kjOffset, HEAD_DIM);
-                            scores[j] = TensorPrimitives.Dot(qi, kj) * scale;
+                            nint kjOffset = ((nint)realJ * HEADS + h) * HEAD_DIM;
+                            var kj = kSpan.Slice((int)kjOffset, HEAD_DIM);
+                            TensorSpan<float> kjTs = new TensorSpan<float>(kj);
+                            scores[j] = Tensor.Dot<float>(qiTs, kjTs) * scale;
                         }
 
                         TensorOperations.Softmax(scores);
 
-                        int outOffset = (i * HEADS + h) * HEAD_DIM;
-                        var outH = new Span<float>(ptrOut + outOffset, HEAD_DIM);
-                        outH.Clear();
+                        nint outOffset = ((nint)i * HEADS + h) * HEAD_DIM;
+                        var outH = outSpan.Slice((int)outOffset, HEAD_DIM);
+                        outH.Fill(0);
 
                         for (int j = 0; j < len; j++)
                         {
                             int realJ = startJ + j;
-                            int vjOffset = (realJ * HEADS + h) * HEAD_DIM;
-                            var vj = new ReadOnlySpan<float>(ptrV + vjOffset, HEAD_DIM);
+                            nint vjOffset = ((nint)realJ * HEADS + h) * HEAD_DIM;
+                            var vj = vSpan.Slice((int)vjOffset, HEAD_DIM);
                             float score = scores[j];
 
                             for (int d = 0; d < HEAD_DIM; d++)
@@ -337,8 +341,12 @@ namespace Voxtral
                             }
                         }
                     }
-                });
-            }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(scoresArray);
+                    }
+                }
+            });
         }
     }
 }
