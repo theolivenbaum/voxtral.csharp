@@ -292,15 +292,16 @@ namespace Voxtral
 
             Parallel.For(0, HEADS, h =>
             {
-                var qSpan = q.AsTensorSpan();
-                var kSpan = k.AsTensorSpan();
-                var vSpan = v.AsTensorSpan();
-                var outSpan = output.AsTensorSpan();
+                var qSpan = q.AsSpan();
+                var kSpan = k.AsSpan();
+                var vSpan = v.AsSpan();
+                var outSpan = output.AsSpan();
 
                 for (int i = 0; i < seqLen; i++)
                 {
                     nint qiOffset = ((nint)i * HEADS + h) * HEAD_DIM;
-                    var qi = qSpan.Slice(qiOffset, HEAD_DIM);
+                    var qi = qSpan.Slice((int)qiOffset, HEAD_DIM);
+                    TensorSpan<float> qiTs = new TensorSpan<float>(qi);
 
                     int startJ = Math.Max(0, i - window + 1);
                     int endJ = i;
@@ -316,21 +317,22 @@ namespace Voxtral
                         {
                             int realJ = startJ + j;
                             nint kjOffset = ((nint)realJ * HEADS + h) * HEAD_DIM;
-                            var kj = kSpan.Slice(kjOffset, HEAD_DIM);
-                            scores[j] = Tensor.Dot<float>(qi, kj) * scale;
+                            var kj = kSpan.Slice((int)kjOffset, HEAD_DIM);
+                            TensorSpan<float> kjTs = new TensorSpan<float>(kj);
+                            scores[j] = Tensor.Dot<float>(qiTs, kjTs) * scale;
                         }
 
                         TensorOperations.Softmax(scores);
 
                         nint outOffset = ((nint)i * HEADS + h) * HEAD_DIM;
-                        var outH = outSpan.Slice(outOffset, HEAD_DIM);
+                        var outH = outSpan.Slice((int)outOffset, HEAD_DIM);
                         outH.Fill(0);
 
                         for (int j = 0; j < len; j++)
                         {
                             int realJ = startJ + j;
                             nint vjOffset = ((nint)realJ * HEADS + h) * HEAD_DIM;
-                            var vj = vSpan.Slice(vjOffset, HEAD_DIM);
+                            var vj = vSpan.Slice((int)vjOffset, HEAD_DIM);
                             float score = scores[j];
 
                             for (int d = 0; d < HEAD_DIM; d++)

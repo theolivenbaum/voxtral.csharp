@@ -297,10 +297,10 @@ namespace Voxtral
 
             Parallel.For(0, qHeads, h =>
             {
-                var qSpan = q.AsTensorSpan();
-                var outSpan = output.AsTensorSpan();
-                var kCacheSpan = _kCache.AsTensorSpan();
-                var vCacheSpan = _vCache.AsTensorSpan();
+                var qSpan = q.AsSpan();
+                var outSpan = output.AsSpan();
+                var kCacheSpan = _kCache.AsSpan();
+                var vCacheSpan = _vCache.AsSpan();
 
                 int kvH = h / gqaRatio;
 
@@ -309,7 +309,8 @@ namespace Voxtral
                     int absPos = pos + s;
 
                     nint qiOffset = ((nint)s * qHeads + h) * dim;
-                    var qi = qSpan.Slice(qiOffset, dim);
+                    var qi = qSpan.Slice((int)qiOffset, dim);
+                    TensorSpan<float> qiTs = new TensorSpan<float>(qi);
 
                     int startP = Math.Max(0, absPos - WINDOW + 1);
                     int endP = absPos;
@@ -326,15 +327,16 @@ namespace Voxtral
                             int pIdx = startP + j;
                             int cacheIdx = pIdx % WINDOW;
                             nint kOffset = ((nint)cacheIdx * kvHeads + kvH) * dim;
-                            var kj = kCacheSpan.Slice(kOffset, dim);
+                            var kj = kCacheSpan.Slice((int)kOffset, dim);
+                            TensorSpan<float> kjTs = new TensorSpan<float>(kj);
 
-                            scores[j] = Tensor.Dot<float>(qi, kj) * scale;
+                            scores[j] = Tensor.Dot<float>(qiTs, kjTs) * scale;
                         }
 
                         TensorOperations.Softmax(scores);
 
                         nint outOffset = ((nint)s * qHeads + h) * dim;
-                        var outH = outSpan.Slice(outOffset, dim);
+                        var outH = outSpan.Slice((int)outOffset, dim);
                         outH.Fill(0);
 
                         for (int j = 0; j < len; j++)
@@ -342,7 +344,7 @@ namespace Voxtral
                             int pIdx = startP + j;
                             int cacheIdx = pIdx % WINDOW;
                             nint vOffset = ((nint)cacheIdx * kvHeads + kvH) * dim;
-                            var vj = vCacheSpan.Slice(vOffset, dim);
+                            var vj = vCacheSpan.Slice((int)vOffset, dim);
 
                             float score = scores[j];
 
