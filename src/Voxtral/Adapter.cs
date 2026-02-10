@@ -5,7 +5,7 @@ namespace Voxtral
 {
     public class Adapter
     {
-        private readonly float[] _w0, _w1;
+        private readonly Tensor<float> _w0, _w1;
 
         private const int DOWNSAMPLE = 4;
         private const int ENC_DIM = 1280;
@@ -16,8 +16,8 @@ namespace Voxtral
         public Adapter(SafetensorsReader reader)
         {
             string p = "mm_streams_embeddings.embedding_module.audio_language_projection";
-            _w0 = reader.LoadTensor($"{p}.0.weight").ToArray();
-            _w1 = reader.LoadTensor($"{p}.2.weight").ToArray();
+            _w0 = reader.LoadTensor($"{p}.0.weight");
+            _w1 = reader.LoadTensor($"{p}.2.weight");
         }
 
         public float[] Forward(float[] encOut)
@@ -35,14 +35,14 @@ namespace Voxtral
             float[] hidden = new float[outLen * HIDDEN_DIM];
 
             // Linear 0: [outLen, 5120] -> [outLen, 3072]
-            TensorOperations.Linear(encSpan, _w0, ReadOnlySpan<float>.Empty, hidden, outLen, HIDDEN_DIM, ADAPTER_HIDDEN);
+            TensorOperations.Linear(encSpan, _w0.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, hidden, outLen, HIDDEN_DIM, ADAPTER_HIDDEN);
 
             // GELU
             TensorOperations.Gelu(hidden, hidden);
 
             // Linear 1: [outLen, 3072] -> [outLen, 3072]
             float[] output = new float[outLen * DEC_DIM];
-            TensorOperations.Linear(hidden, _w1, ReadOnlySpan<float>.Empty, output, outLen, DEC_DIM, HIDDEN_DIM);
+            TensorOperations.Linear(hidden, _w1.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, output, outLen, DEC_DIM, HIDDEN_DIM);
 
             return output;
         }

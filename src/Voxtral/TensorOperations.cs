@@ -10,6 +10,18 @@ namespace Voxtral
 {
     public static class TensorOperations
     {
+        public static void RMSNorm(ReadOnlySpan<float> x, ReadOnlyTensorSpan<float> w, Span<float> y, float eps)
+        {
+            unsafe
+            {
+                fixed (float* pw = w)
+                {
+                    ReadOnlySpan<float> wSpan = new ReadOnlySpan<float>(pw, (int)w.FlattenedLength);
+                    RMSNorm(x, wSpan, y, eps);
+                }
+            }
+        }
+
         public static void RMSNorm(ReadOnlySpan<float> x, ReadOnlySpan<float> w, Span<float> y, float eps)
         {
             // x: [dim], w: [dim], y: [dim]
@@ -111,6 +123,20 @@ namespace Voxtral
 
                  offset += count;
              }
+        }
+
+        public static void Linear(ReadOnlySpan<float> x, ReadOnlyTensorSpan<float> w, ReadOnlyTensorSpan<float> b, Span<float> y, int M, int N, int K)
+        {
+            unsafe
+            {
+                fixed (float* pw = w)
+                fixed (float* pb = b)
+                {
+                    ReadOnlySpan<float> wSpan = new ReadOnlySpan<float>(pw, (int)w.FlattenedLength);
+                    ReadOnlySpan<float> bSpan = (b.FlattenedLength > 0) ? new ReadOnlySpan<float>(pb, (int)b.FlattenedLength) : ReadOnlySpan<float>.Empty;
+                    Linear(x, wSpan, bSpan, y, M, N, K);
+                }
+            }
         }
 
         public static void Linear(ReadOnlySpan<float> x, ReadOnlySpan<float> w, ReadOnlySpan<float> b, Span<float> y, int M, int N, int K)

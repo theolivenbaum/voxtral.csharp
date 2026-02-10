@@ -17,14 +17,14 @@ namespace Voxtral
         private const float ROPE_THETA = 1000000.0f;
         private const int VOCAB_SIZE = 131072;
 
-        private readonly float[] _tokEmbeddings; // [VOCAB, DIM]
-        private readonly float[] _finalNorm;
+        private readonly Tensor<float> _tokEmbeddings; // [VOCAB, DIM]
+        private readonly Tensor<float> _finalNorm;
         private readonly DecoderLayer[] _layers;
 
         public Decoder(SafetensorsReader reader)
         {
-            _tokEmbeddings = reader.LoadTensor("mm_streams_embeddings.embedding_module.tok_embeddings.weight").ToArray();
-            _finalNorm = reader.LoadTensor("norm.weight").ToArray();
+            _tokEmbeddings = reader.LoadTensor("mm_streams_embeddings.embedding_module.tok_embeddings.weight");
+            _finalNorm = reader.LoadTensor("norm.weight");
 
             _layers = new DecoderLayer[LAYERS];
             for (int i = 0; i < LAYERS; i++)
@@ -36,7 +36,16 @@ namespace Voxtral
         public float[] EmbedToken(int tokenId)
         {
             float[] embed = new float[DIM];
-            Array.Copy(_tokEmbeddings, tokenId * DIM, embed, 0, DIM);
+            unsafe
+            {
+                fixed (float* pTok = _tokEmbeddings.AsReadOnlyTensorSpan())
+                fixed (float* pEmbed = embed)
+                {
+                    float* pSrc = pTok + tokenId * DIM;
+                    long bytes = DIM * sizeof(float);
+                    Buffer.MemoryCopy(pSrc, pEmbed, bytes, bytes);
+                }
+            }
             return embed;
         }
 
@@ -63,11 +72,11 @@ namespace Voxtral
             }
 
             // Final Norm
-            TensorOperations.RMSNorm(h, _finalNorm, h, NORM_EPS);
+            TensorOperations.RMSNorm(h, _finalNorm.AsReadOnlyTensorSpan(), h, NORM_EPS);
 
             // Logits: h @ tok_embeddings.T
             float[] logits = new float[VOCAB_SIZE];
-            TensorOperations.Linear(h.AsSpan(), _tokEmbeddings, ReadOnlySpan<float>.Empty, logits, 1, VOCAB_SIZE, DIM);
+            TensorOperations.Linear(h.AsSpan(), _tokEmbeddings.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, logits, 1, VOCAB_SIZE, DIM);
 
             return logits;
         }
@@ -101,10 +110,10 @@ namespace Voxtral
         private const float ROPE_THETA = 1000000.0f;
 
         private readonly float[] _ropeFreqs;
-        private readonly float[] _attnNorm, _ffnNorm;
-        private readonly float[] _wq, _wk, _wv, _wo;
-        private readonly float[] _w1, _w2, _w3;
-        private readonly float[] _adaDown, _adaUp;
+        private readonly Tensor<float> _attnNorm, _ffnNorm;
+        private readonly Tensor<float> _wq, _wk, _wv, _wo;
+        private readonly Tensor<float> _w1, _w2, _w3;
+        private readonly Tensor<float> _adaDown, _adaUp;
 
         // KV Cache
         private readonly float[] _kCache; // [WINDOW * KV_HEADS * HEAD_DIM]
@@ -122,20 +131,20 @@ namespace Voxtral
 
             string p = $"layers.{layerIdx}";
 
-            _attnNorm = reader.LoadTensor($"{p}.attention_norm.weight").ToArray();
-            _ffnNorm = reader.LoadTensor($"{p}.ffn_norm.weight").ToArray();
+            _attnNorm = reader.LoadTensor($"{p}.attention_norm.weight");
+            _ffnNorm = reader.LoadTensor($"{p}.ffn_norm.weight");
 
-            _wq = reader.LoadTensor($"{p}.attention.wq.weight").ToArray();
-            _wk = reader.LoadTensor($"{p}.attention.wk.weight").ToArray();
-            _wv = reader.LoadTensor($"{p}.attention.wv.weight").ToArray();
-            _wo = reader.LoadTensor($"{p}.attention.wo.weight").ToArray();
+            _wq = reader.LoadTensor($"{p}.attention.wq.weight");
+            _wk = reader.LoadTensor($"{p}.attention.wk.weight");
+            _wv = reader.LoadTensor($"{p}.attention.wv.weight");
+            _wo = reader.LoadTensor($"{p}.attention.wo.weight");
 
-            _w1 = reader.LoadTensor($"{p}.feed_forward.w1.weight").ToArray();
-            _w2 = reader.LoadTensor($"{p}.feed_forward.w2.weight").ToArray();
-            _w3 = reader.LoadTensor($"{p}.feed_forward.w3.weight").ToArray();
+            _w1 = reader.LoadTensor($"{p}.feed_forward.w1.weight");
+            _w2 = reader.LoadTensor($"{p}.feed_forward.w2.weight");
+            _w3 = reader.LoadTensor($"{p}.feed_forward.w3.weight");
 
-            _adaDown = reader.LoadTensor($"{p}.ada_rms_norm_t_cond.0.weight").ToArray();
-            _adaUp = reader.LoadTensor($"{p}.ada_rms_norm_t_cond.2.weight").ToArray();
+            _adaDown = reader.LoadTensor($"{p}.ada_rms_norm_t_cond.0.weight");
+            _adaUp = reader.LoadTensor($"{p}.ada_rms_norm_t_cond.2.weight");
 
             _kCache = new float[WINDOW * KV_HEADS * HEAD_DIM];
             _vCache = new float[WINDOW * KV_HEADS * HEAD_DIM];
@@ -148,7 +157,7 @@ namespace Voxtral
             // 1. RMSNorm
             for (int s = 0; s < seqLen; s++)
             {
-                TensorOperations.RMSNorm(h.Slice(s*DIM, DIM), _attnNorm, xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
+                TensorOperations.RMSNorm(h.Slice(s*DIM, DIM), _attnNorm.AsReadOnlyTensorSpan(), xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
             }
 
             // 2. Attention
@@ -159,9 +168,9 @@ namespace Voxtral
             float[] k = new float[seqLen * kvDim];
             float[] v = new float[seqLen * kvDim];
 
-            TensorOperations.Linear(xNorm, _wq, ReadOnlySpan<float>.Empty, q, seqLen, qDim, DIM);
-            TensorOperations.Linear(xNorm, _wk, ReadOnlySpan<float>.Empty, k, seqLen, kvDim, DIM);
-            TensorOperations.Linear(xNorm, _wv, ReadOnlySpan<float>.Empty, v, seqLen, kvDim, DIM);
+            TensorOperations.Linear(xNorm, _wq.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, q, seqLen, qDim, DIM);
+            TensorOperations.Linear(xNorm, _wk.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, k, seqLen, kvDim, DIM);
+            TensorOperations.Linear(xNorm, _wv.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, v, seqLen, kvDim, DIM);
 
             // RoPE
             int halfDim = HEAD_DIM / 2;
@@ -184,25 +193,25 @@ namespace Voxtral
 
             // Output Projection
             float[] projOut = new float[seqLen * DIM];
-            TensorOperations.Linear(attnOut, _wo, ReadOnlySpan<float>.Empty, projOut, seqLen, DIM, qDim);
+            TensorOperations.Linear(attnOut, _wo.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, projOut, seqLen, DIM, qDim);
 
             TensorPrimitives.Add(h, projOut, h);
 
             // 3. FFN
             for (int s = 0; s < seqLen; s++)
             {
-                TensorOperations.RMSNorm(h.Slice(s*DIM, DIM), _ffnNorm, xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
+                TensorOperations.RMSNorm(h.Slice(s*DIM, DIM), _ffnNorm.AsReadOnlyTensorSpan(), xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
             }
 
             // Ada Norm
             if (tCond != null)
             {
                 float[] adaHidden = new float[32];
-                TensorOperations.Linear(tCond, _adaDown, ReadOnlySpan<float>.Empty, adaHidden, 1, 32, DIM);
+                TensorOperations.Linear(tCond, _adaDown.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, adaHidden, 1, 32, DIM);
                 TensorOperations.Gelu(adaHidden, adaHidden);
 
                 float[] adaScale = new float[DIM];
-                TensorOperations.Linear(adaHidden, _adaUp, ReadOnlySpan<float>.Empty, adaScale, 1, DIM, 32);
+                TensorOperations.Linear(adaHidden, _adaUp.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, adaScale, 1, DIM, 32);
 
                 for (int s = 0; s < seqLen; s++)
                 {
@@ -218,13 +227,13 @@ namespace Voxtral
             float[] gate = new float[seqLen * HIDDEN];
             float[] up = new float[seqLen * HIDDEN];
 
-            TensorOperations.Linear(xNorm, _w1, ReadOnlySpan<float>.Empty, gate, seqLen, HIDDEN, DIM);
-            TensorOperations.Linear(xNorm, _w3, ReadOnlySpan<float>.Empty, up, seqLen, HIDDEN, DIM);
+            TensorOperations.Linear(xNorm, _w1.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, gate, seqLen, HIDDEN, DIM);
+            TensorOperations.Linear(xNorm, _w3.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, up, seqLen, HIDDEN, DIM);
 
             TensorOperations.SiLU(gate, gate);
             TensorPrimitives.Multiply(gate, up, gate);
 
-            TensorOperations.Linear(gate, _w2, ReadOnlySpan<float>.Empty, projOut, seqLen, DIM, HIDDEN);
+            TensorOperations.Linear(gate, _w2.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, projOut, seqLen, DIM, HIDDEN);
 
             TensorPrimitives.Add(h, projOut, h);
         }

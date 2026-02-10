@@ -15,7 +15,7 @@ namespace Voxtral
 
         private readonly ConvStem _convStem;
         private readonly EncoderLayer[] _layers;
-        private readonly float[] _normWeight;
+        private readonly Tensor<float> _normWeight;
 
         public Encoder(SafetensorsReader reader)
         {
@@ -25,7 +25,7 @@ namespace Voxtral
             {
                 _layers[i] = new EncoderLayer(reader, i);
             }
-            _normWeight = reader.LoadTensor("mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight").ToArray();
+            _normWeight = reader.LoadTensor("mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight");
         }
 
         public float[] Forward(Tensor<float> mel, out int seqLen)
@@ -51,7 +51,7 @@ namespace Voxtral
             for (int s = 0; s < seqLen; s++)
             {
                 var token = hSpan.Slice(s * DIM, DIM);
-                TensorOperations.RMSNorm(token, _normWeight, token, NORM_EPS);
+                TensorOperations.RMSNorm(token, _normWeight.AsReadOnlyTensorSpan(), token, NORM_EPS);
             }
 
             return hArr;
@@ -78,16 +78,16 @@ namespace Voxtral
 
     class ConvStem
     {
-        private readonly float[] _w0, _b0;
-        private readonly float[] _w1, _b1;
+        private readonly Tensor<float> _w0, _b0;
+        private readonly Tensor<float> _w1, _b1;
 
         public ConvStem(SafetensorsReader reader)
         {
             string p = "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers";
-            _w0 = reader.LoadTensor($"{p}.0.conv.weight").ToArray(); // [1280, 128, 3]
-            _b0 = reader.LoadTensor($"{p}.0.conv.bias").ToArray();   // [1280]
-            _w1 = reader.LoadTensor($"{p}.1.conv.weight").ToArray(); // [1280, 1280, 3]
-            _b1 = reader.LoadTensor($"{p}.1.conv.bias").ToArray();   // [1280]
+            _w0 = reader.LoadTensor($"{p}.0.conv.weight"); // [1280, 128, 3]
+            _b0 = reader.LoadTensor($"{p}.0.conv.bias");   // [1280]
+            _w1 = reader.LoadTensor($"{p}.1.conv.weight"); // [1280, 1280, 3]
+            _b1 = reader.LoadTensor($"{p}.1.conv.bias");   // [1280]
         }
 
         public float[] Forward(Tensor<float> mel, out int outFrames)
@@ -99,9 +99,7 @@ namespace Voxtral
             float[] h0 = new float[frames * 1280];
             // Reuse input array if possible? No, float[].
 
-            float[] melArr = mel.ToArray(); // Copy input
-
-            ApplyConv1dInterleaved(melArr, _w0, _b0, h0, 128, 1280, 3, 1, frames);
+            ApplyConv1dInterleaved(mel.AsReadOnlyTensorSpan(), _w0.AsReadOnlyTensorSpan(), _b0.AsReadOnlyTensorSpan(), h0, 128, 1280, 3, 1, frames);
 
             // GELU
             TensorOperations.Gelu(h0, h0);
@@ -111,7 +109,7 @@ namespace Voxtral
             int frames2 = (frames + 1) / 2; // Stride 2
 
             float[] out1 = new float[1280 * frames2];
-            ApplyConv1dInterleaved(h0, _w1, _b1, out1, 1280, 1280, 3, 2, frames);
+            ApplyConv1dInterleaved(h0.AsSpan(), _w1.AsReadOnlyTensorSpan(), _b1.AsReadOnlyTensorSpan(), out1, 1280, 1280, 3, 2, frames);
 
             // GELU
             TensorOperations.Gelu(out1, out1);
@@ -141,7 +139,40 @@ namespace Voxtral
             return outT;
         }
 
-        private void ApplyConv1dInterleaved(float[] input, float[] weight, float[] bias, float[] output,
+        private void ApplyConv1dInterleaved(ReadOnlyTensorSpan<float> input, ReadOnlyTensorSpan<float> weight, ReadOnlyTensorSpan<float> bias, Span<float> output,
+                                            int cIn, int cOut, int kSize, int stride, int len)
+        {
+            unsafe
+            {
+                fixed (float* pIn = input)
+                fixed (float* pW = weight)
+                fixed (float* pB = bias)
+                {
+                     ApplyConv1dInterleavedImpl(new ReadOnlySpan<float>(pIn, (int)input.FlattenedLength),
+                                                new ReadOnlySpan<float>(pW, (int)weight.FlattenedLength),
+                                                new ReadOnlySpan<float>(pB, (int)bias.FlattenedLength),
+                                                output, cIn, cOut, kSize, stride, len);
+                }
+            }
+        }
+
+        private void ApplyConv1dInterleaved(ReadOnlySpan<float> input, ReadOnlyTensorSpan<float> weight, ReadOnlyTensorSpan<float> bias, Span<float> output,
+                                            int cIn, int cOut, int kSize, int stride, int len)
+        {
+            unsafe
+            {
+                fixed (float* pW = weight)
+                fixed (float* pB = bias)
+                {
+                     ApplyConv1dInterleavedImpl(input,
+                                                new ReadOnlySpan<float>(pW, (int)weight.FlattenedLength),
+                                                new ReadOnlySpan<float>(pB, (int)bias.FlattenedLength),
+                                                output, cIn, cOut, kSize, stride, len);
+                }
+            }
+        }
+
+        private void ApplyConv1dInterleavedImpl(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, ReadOnlySpan<float> bias, Span<float> output,
                                             int cIn, int cOut, int kSize, int stride, int len)
         {
             int pad = (kSize - 1) / 2; // symmetric padding? No, wait.
@@ -193,12 +224,12 @@ namespace Voxtral
 
     class EncoderLayer
     {
-        private readonly float[] _attnNorm, _ffnNorm;
-        private readonly float[] _wq, _wq_b;
-        private readonly float[] _wk;
-        private readonly float[] _wv, _wv_b;
-        private readonly float[] _wo, _wo_b;
-        private readonly float[] _w1, _w2, _w3, _w2_b;
+        private readonly Tensor<float> _attnNorm, _ffnNorm;
+        private readonly Tensor<float> _wq, _wq_b;
+        private readonly Tensor<float> _wk;
+        private readonly Tensor<float> _wv, _wv_b;
+        private readonly Tensor<float> _wo, _wo_b;
+        private readonly Tensor<float> _w1, _w2, _w3, _w2_b;
 
         private const int DIM = 1280;
         private const int HEADS = 32;
@@ -210,21 +241,21 @@ namespace Voxtral
         {
             string p = $"mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{layerIdx}";
 
-            _attnNorm = reader.LoadTensor($"{p}.attention_norm.weight").ToArray();
-            _ffnNorm = reader.LoadTensor($"{p}.ffn_norm.weight").ToArray();
+            _attnNorm = reader.LoadTensor($"{p}.attention_norm.weight");
+            _ffnNorm = reader.LoadTensor($"{p}.ffn_norm.weight");
 
-            _wq = reader.LoadTensor($"{p}.attention.wq.weight").ToArray();
-            _wq_b = reader.LoadTensor($"{p}.attention.wq.bias").ToArray();
-            _wk = reader.LoadTensor($"{p}.attention.wk.weight").ToArray();
-            _wv = reader.LoadTensor($"{p}.attention.wv.weight").ToArray();
-            _wv_b = reader.LoadTensor($"{p}.attention.wv.bias").ToArray();
-            _wo = reader.LoadTensor($"{p}.attention.wo.weight").ToArray();
-            _wo_b = reader.LoadTensor($"{p}.attention.wo.bias").ToArray();
+            _wq = reader.LoadTensor($"{p}.attention.wq.weight");
+            _wq_b = reader.LoadTensor($"{p}.attention.wq.bias");
+            _wk = reader.LoadTensor($"{p}.attention.wk.weight");
+            _wv = reader.LoadTensor($"{p}.attention.wv.weight");
+            _wv_b = reader.LoadTensor($"{p}.attention.wv.bias");
+            _wo = reader.LoadTensor($"{p}.attention.wo.weight");
+            _wo_b = reader.LoadTensor($"{p}.attention.wo.bias");
 
-            _w1 = reader.LoadTensor($"{p}.feed_forward.w1.weight").ToArray();
-            _w2 = reader.LoadTensor($"{p}.feed_forward.w2.weight").ToArray();
-            _w2_b = reader.LoadTensor($"{p}.feed_forward.w2.bias").ToArray();
-            _w3 = reader.LoadTensor($"{p}.feed_forward.w3.weight").ToArray();
+            _w1 = reader.LoadTensor($"{p}.feed_forward.w1.weight");
+            _w2 = reader.LoadTensor($"{p}.feed_forward.w2.weight");
+            _w2_b = reader.LoadTensor($"{p}.feed_forward.w2.bias");
+            _w3 = reader.LoadTensor($"{p}.feed_forward.w3.weight");
         }
 
         public void Forward(float[] h, int seqLen, float[] cos, float[] sin)
@@ -237,7 +268,7 @@ namespace Voxtral
             // 1. RMSNorm
             for (int s = 0; s < seqLen; s++)
             {
-                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), _attnNorm, xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
+                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), _attnNorm.AsReadOnlyTensorSpan(), xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
             }
 
             // 2. Attention
@@ -246,9 +277,9 @@ namespace Voxtral
             float[] k = new float[seqLen * qDim];
             float[] v = new float[seqLen * qDim];
 
-            TensorOperations.Linear(xNorm, _wq, _wq_b, q, seqLen, qDim, DIM);
-            TensorOperations.Linear(xNorm, _wk, ReadOnlySpan<float>.Empty, k, seqLen, qDim, DIM);
-            TensorOperations.Linear(xNorm, _wv, _wv_b, v, seqLen, qDim, DIM);
+            TensorOperations.Linear(xNorm, _wq.AsReadOnlyTensorSpan(), _wq_b.AsReadOnlyTensorSpan(), q, seqLen, qDim, DIM);
+            TensorOperations.Linear(xNorm, _wk.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, k, seqLen, qDim, DIM);
+            TensorOperations.Linear(xNorm, _wv.AsReadOnlyTensorSpan(), _wv_b.AsReadOnlyTensorSpan(), v, seqLen, qDim, DIM);
 
             // RoPE
             TensorOperations.ApplyRoPE(q, cos, sin, seqLen, HEADS, HEAD_DIM);
@@ -260,26 +291,26 @@ namespace Voxtral
 
             // Output Projection
             float[] projOut = new float[seqLen * DIM];
-            TensorOperations.Linear(attnOut, _wo, _wo_b, projOut, seqLen, DIM, qDim);
+            TensorOperations.Linear(attnOut, _wo.AsReadOnlyTensorSpan(), _wo_b.AsReadOnlyTensorSpan(), projOut, seqLen, DIM, qDim);
 
             TensorPrimitives.Add(hSpan, projOut, hSpan);
 
             // 3. FFN
             for (int s = 0; s < seqLen; s++)
             {
-                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), _ffnNorm, xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
+                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), _ffnNorm.AsReadOnlyTensorSpan(), xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
             }
 
             float[] gate = new float[seqLen * HIDDEN];
             float[] up = new float[seqLen * HIDDEN];
 
-            TensorOperations.Linear(xNorm, _w1, ReadOnlySpan<float>.Empty, gate, seqLen, HIDDEN, DIM);
-            TensorOperations.Linear(xNorm, _w3, ReadOnlySpan<float>.Empty, up, seqLen, HIDDEN, DIM);
+            TensorOperations.Linear(xNorm, _w1.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, gate, seqLen, HIDDEN, DIM);
+            TensorOperations.Linear(xNorm, _w3.AsReadOnlyTensorSpan(), ReadOnlyTensorSpan<float>.Empty, up, seqLen, HIDDEN, DIM);
 
             TensorOperations.SiLU(gate, gate);
             TensorPrimitives.Multiply(gate, up, gate);
 
-            TensorOperations.Linear(gate, _w2, _w2_b, projOut, seqLen, DIM, HIDDEN);
+            TensorOperations.Linear(gate, _w2.AsReadOnlyTensorSpan(), _w2_b.AsReadOnlyTensorSpan(), projOut, seqLen, DIM, HIDDEN);
 
             TensorPrimitives.Add(hSpan, projOut, hSpan);
         }
