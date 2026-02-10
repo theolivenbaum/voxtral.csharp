@@ -1,5 +1,6 @@
 using System;
 using System.Numerics.Tensors;
+using System.Threading.Tasks;
 
 namespace Voxtral
 {
@@ -15,7 +16,7 @@ namespace Voxtral
 
         private readonly ConvStem _convStem;
         private readonly EncoderLayer[] _layers;
-        private readonly float[] _normWeight;
+        private readonly Tensor<float> _normWeight;
 
         public Encoder(SafetensorsReader reader)
         {
@@ -25,43 +26,38 @@ namespace Voxtral
             {
                 _layers[i] = new EncoderLayer(reader, i);
             }
-            _normWeight = reader.LoadTensor("mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight").ToArray();
+            _normWeight = reader.LoadTensor("mm_streams_embeddings.embedding_module.whisper_encoder.transformer.norm.weight");
         }
 
-        public float[] Forward(Tensor<float> mel, out int seqLen)
+        public Tensor<float> Forward(Tensor<float> mel, out int seqLen)
         {
-            // mel: [128, frames]
-            // ConvStem
             var hArr = _convStem.Forward(mel, out seqLen);
 
-            // hArr: [seqLen * 1280]
-
-            // RoPE
-            float[] cos, sin;
+            Tensor<float> cos, sin;
             ComputeRope(seqLen, out cos, out sin);
 
-            // Layers
             for (int i = 0; i < LAYERS; i++)
             {
                 _layers[i].Forward(hArr, seqLen, cos, sin);
             }
 
-            // Final Norm
             var hSpan = hArr.AsSpan();
+            var normSpan = _normWeight.AsSpan();
+
             for (int s = 0; s < seqLen; s++)
             {
                 var token = hSpan.Slice(s * DIM, DIM);
-                TensorOperations.RMSNorm(token, _normWeight, token, NORM_EPS);
+                TensorOperations.RMSNorm(token, normSpan, token, NORM_EPS);
             }
 
             return hArr;
         }
 
-        private void ComputeRope(int seqLen, out float[] cos, out float[] sin)
+        private void ComputeRope(int seqLen, out Tensor<float> cos, out Tensor<float> sin)
         {
             int halfDim = HEAD_DIM / 2;
-            cos = new float[seqLen * halfDim];
-            sin = new float[seqLen * halfDim];
+            float[] cosData = new float[seqLen * halfDim];
+            float[] sinData = new float[seqLen * halfDim];
 
             for (int s = 0; s < seqLen; s++)
             {
@@ -69,136 +65,130 @@ namespace Voxtral
                 {
                     float freq = 1.0f / MathF.Pow(ROPE_THETA, 2.0f * i / HEAD_DIM);
                     float angle = s * freq;
-                    cos[s * halfDim + i] = MathF.Cos(angle);
-                    sin[s * halfDim + i] = MathF.Sin(angle);
+                    cosData[s * halfDim + i] = MathF.Cos(angle);
+                    sinData[s * halfDim + i] = MathF.Sin(angle);
                 }
             }
+
+            cos = Tensor.Create(cosData, new nint[] { seqLen, halfDim });
+            sin = Tensor.Create(sinData, new nint[] { seqLen, halfDim });
         }
     }
 
     class ConvStem
     {
-        private readonly float[] _w0, _b0;
-        private readonly float[] _w1, _b1;
+        private readonly Tensor<float> _w0, _b0;
+        private readonly Tensor<float> _w1, _b1;
 
         public ConvStem(SafetensorsReader reader)
         {
             string p = "mm_streams_embeddings.embedding_module.whisper_encoder.conv_layers";
-            _w0 = reader.LoadTensor($"{p}.0.conv.weight").ToArray(); // [1280, 128, 3]
-            _b0 = reader.LoadTensor($"{p}.0.conv.bias").ToArray();   // [1280]
-            _w1 = reader.LoadTensor($"{p}.1.conv.weight").ToArray(); // [1280, 1280, 3]
-            _b1 = reader.LoadTensor($"{p}.1.conv.bias").ToArray();   // [1280]
+            _w0 = reader.LoadTensor($"{p}.0.conv.weight");
+            _b0 = reader.LoadTensor($"{p}.0.conv.bias");
+            _w1 = reader.LoadTensor($"{p}.1.conv.weight");
+            _b1 = reader.LoadTensor($"{p}.1.conv.bias");
         }
 
-        public float[] Forward(Tensor<float> mel, out int outFrames)
+        public Tensor<float> Forward(Tensor<float> mel, out int outFrames)
         {
-            // mel: [128, frames]
-            int frames = (int)mel.Lengths[1];
+            TensorSpan<float> melSpan = mel;
+            int frames = (int)melSpan.Lengths[1];
 
-            // First conv
-            float[] h0 = new float[frames * 1280];
-            // Reuse input array if possible? No, float[].
+            float[] h0Data = new float[frames * 1280];
+            Tensor<float> h0 = Tensor.Create(h0Data, new nint[] { 1280, frames });
 
-            float[] melArr = mel.ToArray(); // Copy input
+            ApplyConv1dInterleaved(mel.AsSpan(), _w0.AsSpan(), _b0.AsSpan(), h0.AsSpan(), 128, 1280, 3, 1, frames);
 
-            ApplyConv1dInterleaved(melArr, _w0, _b0, h0, 128, 1280, 3, 1, frames);
-
-            // GELU
             TensorOperations.Gelu(h0, h0);
 
-            // Second conv
-            // Output frames calculation
-            int frames2 = (frames + 1) / 2; // Stride 2
+            int frames2 = (frames + 1) / 2;
 
-            float[] out1 = new float[1280 * frames2];
-            ApplyConv1dInterleaved(h0, _w1, _b1, out1, 1280, 1280, 3, 2, frames);
+            float[] out1Data = new float[1280 * frames2];
+            Tensor<float> out1 = Tensor.Create(out1Data, new nint[] { 1280, frames2 });
 
-            // GELU
+            ApplyConv1dInterleaved(h0.AsSpan(), _w1.AsSpan(), _b1.AsSpan(), out1.AsSpan(), 1280, 1280, 3, 2, frames);
+
             TensorOperations.Gelu(out1, out1);
 
-            // Transpose to [frames, 1280]
-            float[] outT = new float[frames2 * 1280];
+            float[] outTData = new float[frames2 * 1280];
+            var sOut1 = out1.AsSpan();
+
             for(int t=0; t<frames2; t++)
             {
                 for(int c=0; c<1280; c++)
                 {
-                    outT[t * 1280 + c] = out1[c * frames2 + t];
+                    outTData[t * 1280 + c] = sOut1[c * frames2 + t];
                 }
             }
 
-            // Truncate
+            Tensor<float> outT = Tensor.Create(outTData, new nint[] { frames2, 1280 });
+
             int trunc = frames2 % 4;
             if (trunc > 0)
             {
                 int newLen = frames2 - trunc;
-                float[] truncated = new float[newLen * 1280];
-                Array.Copy(outT, trunc * 1280, truncated, 0, newLen * 1280);
+                float[] truncatedData = new float[newLen * 1280];
+                Array.Copy(outTData, trunc * 1280, truncatedData, 0, newLen * 1280);
+
                 outFrames = newLen;
-                return truncated;
+                return Tensor.Create(truncatedData, new nint[] { newLen, 1280 });
             }
 
             outFrames = frames2;
             return outT;
         }
 
-        private void ApplyConv1dInterleaved(float[] input, float[] weight, float[] bias, float[] output,
+        private unsafe void ApplyConv1dInterleaved(ReadOnlySpan<float> input, ReadOnlySpan<float> weight, ReadOnlySpan<float> bias, Span<float> output,
                                             int cIn, int cOut, int kSize, int stride, int len)
         {
-            int pad = (kSize - 1) / 2; // symmetric padding? No, wait.
-            // Python causal_conv1d pads LEFT only.
-            // padding_total = kSize - stride.
             int paddingTotal = kSize - stride;
-
             int outLen = (len + paddingTotal - kSize) / stride + 1;
-            // Wait, standard conv output length formula: floor((L + 2*pad - dilation*(k-1) - 1)/stride + 1)
-            // Python:
-            // n_frames = (x.shape[-1] - kSize + paddingTotal) / stride + 1
-            // This is equivalent to floor((L + P - K)/S + 1).
 
-            // Note: in my previous manual calculation I used a different formula.
-            // Let's trust Python formula logic.
-
-            // Parallelize over cOut
-            // Note: System.Threading.Tasks.Parallel.For is good here.
-
-            // For now simple loop
-            for (int o = 0; o < cOut; o++)
+            fixed (float* pInput = input)
+            fixed (float* pWeight = weight)
+            fixed (float* pBias = bias)
+            fixed (float* pOutput = output)
             {
-                float b = bias[o];
+                float* pIn = pInput;
+                float* pW = pWeight;
+                float* pB = pBias;
+                float* pOut = pOutput;
 
-                for (int t = 0; t < outLen; t++)
+                Parallel.For(0, cOut, o =>
                 {
-                    float sum = b;
+                    float b = pB[o];
 
-                    for (int k = 0; k < kSize; k++)
+                    for (int t = 0; t < outLen; t++)
                     {
-                        // input index: t * stride - paddingTotal + k
-                        int inT = t * stride - paddingTotal + k;
+                        float sum = b;
 
-                        if (inT >= 0 && inT < len)
+                        for (int k = 0; k < kSize; k++)
                         {
-                            for (int i = 0; i < cIn; i++)
+                            int inT = t * stride - paddingTotal + k;
+
+                            if (inT >= 0 && inT < len)
                             {
-                                // weight index: o * cIn * kSize + i * kSize + k
-                                // input index: i * len + inT
-                                sum += input[i * len + inT] * weight[o * cIn * kSize + i * kSize + k];
+                                for (int i = 0; i < cIn; i++)
+                                {
+                                    sum += pIn[i * len + inT] * pW[o * cIn * kSize + i * kSize + k];
+                                }
                             }
                         }
+                        pOut[o * outLen + t] = sum;
                     }
-                    output[o * outLen + t] = sum;
-                }
+                });
             }
         }
     }
 
     class EncoderLayer
     {
-        private readonly float[] _attnNorm, _ffnNorm;
-        private readonly float[] _wq, _wq_b;
-        private readonly float[] _wk;
-        private readonly float[] _wv, _wv_b;
-        private readonly float[] _wo, _wo_b;
-        private readonly float[] _w1, _w2, _w3, _w2_b;
+        private readonly Tensor<float> _attnNorm, _ffnNorm;
+        private readonly Tensor<float> _wq, _wq_b;
+        private readonly Tensor<float> _wk;
+        private readonly Tensor<float> _wv, _wv_b;
+        private readonly Tensor<float> _wo, _wo_b;
+        private readonly Tensor<float> _w1, _w2, _w3, _w2_b;
 
         private const int DIM = 1280;
         private const int HEADS = 32;
@@ -210,134 +200,144 @@ namespace Voxtral
         {
             string p = $"mm_streams_embeddings.embedding_module.whisper_encoder.transformer.layers.{layerIdx}";
 
-            _attnNorm = reader.LoadTensor($"{p}.attention_norm.weight").ToArray();
-            _ffnNorm = reader.LoadTensor($"{p}.ffn_norm.weight").ToArray();
+            _attnNorm = reader.LoadTensor($"{p}.attention_norm.weight");
+            _ffnNorm = reader.LoadTensor($"{p}.ffn_norm.weight");
 
-            _wq = reader.LoadTensor($"{p}.attention.wq.weight").ToArray();
-            _wq_b = reader.LoadTensor($"{p}.attention.wq.bias").ToArray();
-            _wk = reader.LoadTensor($"{p}.attention.wk.weight").ToArray();
-            _wv = reader.LoadTensor($"{p}.attention.wv.weight").ToArray();
-            _wv_b = reader.LoadTensor($"{p}.attention.wv.bias").ToArray();
-            _wo = reader.LoadTensor($"{p}.attention.wo.weight").ToArray();
-            _wo_b = reader.LoadTensor($"{p}.attention.wo.bias").ToArray();
+            _wq = reader.LoadTensor($"{p}.attention.wq.weight");
+            _wq_b = reader.LoadTensor($"{p}.attention.wq.bias");
+            _wk = reader.LoadTensor($"{p}.attention.wk.weight");
+            _wv = reader.LoadTensor($"{p}.attention.wv.weight");
+            _wv_b = reader.LoadTensor($"{p}.attention.wv.bias");
+            _wo = reader.LoadTensor($"{p}.attention.wo.weight");
+            _wo_b = reader.LoadTensor($"{p}.attention.wo.bias");
 
-            _w1 = reader.LoadTensor($"{p}.feed_forward.w1.weight").ToArray();
-            _w2 = reader.LoadTensor($"{p}.feed_forward.w2.weight").ToArray();
-            _w2_b = reader.LoadTensor($"{p}.feed_forward.w2.bias").ToArray();
-            _w3 = reader.LoadTensor($"{p}.feed_forward.w3.weight").ToArray();
+            _w1 = reader.LoadTensor($"{p}.feed_forward.w1.weight");
+            _w2 = reader.LoadTensor($"{p}.feed_forward.w2.weight");
+            _w2_b = reader.LoadTensor($"{p}.feed_forward.w2.bias");
+            _w3 = reader.LoadTensor($"{p}.feed_forward.w3.weight");
         }
 
-        public void Forward(float[] h, int seqLen, float[] cos, float[] sin)
+        public void Forward(Tensor<float> h, int seqLen, Tensor<float> cos, Tensor<float> sin)
         {
-            // h: [seqLen * 1280]
             var hSpan = h.AsSpan();
 
-            float[] xNorm = new float[seqLen * DIM];
+            float[] xNormData = new float[seqLen * DIM];
+            Tensor<float> xNorm = Tensor.Create(xNormData, new nint[] { seqLen, DIM });
+            var xNormSpan = xNorm.AsSpan();
+            var attnNormSpan = _attnNorm.AsSpan();
 
-            // 1. RMSNorm
             for (int s = 0; s < seqLen; s++)
             {
-                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), _attnNorm, xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
+                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), attnNormSpan, xNormSpan.Slice(s*DIM, DIM), NORM_EPS);
             }
 
-            // 2. Attention
-            int qDim = HEADS * HEAD_DIM; // 2048
-            float[] q = new float[seqLen * qDim];
-            float[] k = new float[seqLen * qDim];
-            float[] v = new float[seqLen * qDim];
+            int qDim = HEADS * HEAD_DIM;
 
-            TensorOperations.Linear(xNorm, _wq, _wq_b, q, seqLen, qDim, DIM);
-            TensorOperations.Linear(xNorm, _wk, ReadOnlySpan<float>.Empty, k, seqLen, qDim, DIM);
-            TensorOperations.Linear(xNorm, _wv, _wv_b, v, seqLen, qDim, DIM);
+            float[] qData = new float[seqLen * qDim];
+            float[] kData = new float[seqLen * qDim];
+            float[] vData = new float[seqLen * qDim];
 
-            // RoPE
+            Tensor<float> q = Tensor.Create(qData, new nint[] { seqLen, qDim });
+            Tensor<float> k = Tensor.Create(kData, new nint[] { seqLen, qDim });
+            Tensor<float> v = Tensor.Create(vData, new nint[] { seqLen, qDim });
+
+            TensorOperations.Linear(xNorm, _wq, _wq_b, q);
+            TensorOperations.Linear(xNorm, _wk, null, k);
+            TensorOperations.Linear(xNorm, _wv, _wv_b, v);
+
             TensorOperations.ApplyRoPE(q, cos, sin, seqLen, HEADS, HEAD_DIM);
             TensorOperations.ApplyRoPE(k, cos, sin, seqLen, HEADS, HEAD_DIM);
 
-            // Self-Attention
-            float[] attnOut = new float[seqLen * qDim];
+            float[] attnOutData = new float[seqLen * qDim];
+            Tensor<float> attnOut = Tensor.Create(attnOutData, new nint[] { seqLen, qDim });
+
             PerformAttention(q, k, v, attnOut, seqLen);
 
-            // Output Projection
-            float[] projOut = new float[seqLen * DIM];
-            TensorOperations.Linear(attnOut, _wo, _wo_b, projOut, seqLen, DIM, qDim);
+            float[] projOutData = new float[seqLen * DIM];
+            Tensor<float> projOut = Tensor.Create(projOutData, new nint[] { seqLen, DIM });
 
-            TensorPrimitives.Add(hSpan, projOut, hSpan);
+            TensorOperations.Linear(attnOut, _wo, _wo_b, projOut);
 
-            // 3. FFN
+            TensorPrimitives.Add(hSpan, projOut.AsSpan(), hSpan);
+
+            var ffnNormSpan = _ffnNorm.AsSpan();
             for (int s = 0; s < seqLen; s++)
             {
-                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), _ffnNorm, xNorm.AsSpan(s*DIM, DIM), NORM_EPS);
+                TensorOperations.RMSNorm(hSpan.Slice(s*DIM, DIM), ffnNormSpan, xNormSpan.Slice(s*DIM, DIM), NORM_EPS);
             }
 
-            float[] gate = new float[seqLen * HIDDEN];
-            float[] up = new float[seqLen * HIDDEN];
+            float[] gateData = new float[seqLen * HIDDEN];
+            float[] upData = new float[seqLen * HIDDEN];
+            Tensor<float> gate = Tensor.Create(gateData, new nint[] { seqLen, HIDDEN });
+            Tensor<float> up = Tensor.Create(upData, new nint[] { seqLen, HIDDEN });
 
-            TensorOperations.Linear(xNorm, _w1, ReadOnlySpan<float>.Empty, gate, seqLen, HIDDEN, DIM);
-            TensorOperations.Linear(xNorm, _w3, ReadOnlySpan<float>.Empty, up, seqLen, HIDDEN, DIM);
+            TensorOperations.Linear(xNorm, _w1, null, gate);
+            TensorOperations.Linear(xNorm, _w3, null, up);
 
             TensorOperations.SiLU(gate, gate);
-            TensorPrimitives.Multiply(gate, up, gate);
+            TensorPrimitives.Multiply(gate.AsSpan(), up.AsSpan(), gate.AsSpan());
 
-            TensorOperations.Linear(gate, _w2, _w2_b, projOut, seqLen, DIM, HIDDEN);
+            TensorOperations.Linear(gate, _w2, _w2_b, projOut);
 
-            TensorPrimitives.Add(hSpan, projOut, hSpan);
+            TensorPrimitives.Add(hSpan, projOut.AsSpan(), hSpan);
         }
 
-        private void PerformAttention(float[] q, float[] k, float[] v, float[] output, int seqLen)
+        private unsafe void PerformAttention(Tensor<float> q, Tensor<float> k, Tensor<float> v, Tensor<float> output, int seqLen)
         {
             int window = 750;
             float scale = 1.0f / MathF.Sqrt(HEAD_DIM);
 
-            // Reusing buffer for scores to avoid allocs?
-            // Need thread-local or stackalloc if small.
-            // HEAD_DIM is 64. seqLen can be large.
-            // window is 750.
-            // So scores size is at most 751?
-
-            // For now allocate inside. Optimized version would use buffer.
-
-            for (int h = 0; h < HEADS; h++)
+            fixed (float* pQ = q.AsSpan())
+            fixed (float* pK = k.AsSpan())
+            fixed (float* pV = v.AsSpan())
+            fixed (float* pOut = output.AsSpan())
             {
-                for (int i = 0; i < seqLen; i++)
+                float* ptrQ = pQ;
+                float* ptrK = pK;
+                float* ptrV = pV;
+                float* ptrOut = pOut;
+
+                Parallel.For(0, HEADS, h =>
                 {
-                    var qi = q.AsSpan((i * HEADS + h) * HEAD_DIM, HEAD_DIM);
-
-                    int startJ = Math.Max(0, i - window + 1);
-                    int endJ = i;
-                    int len = endJ - startJ + 1;
-
-                    // Allocating 750 floats is okayish.
-                    float[] scores = new float[len];
-
-                    for (int j = 0; j < len; j++)
+                    for (int i = 0; i < seqLen; i++)
                     {
-                        int realJ = startJ + j;
-                        var kj = k.AsSpan((realJ * HEADS + h) * HEAD_DIM, HEAD_DIM);
-                        scores[j] = TensorPrimitives.Dot(qi, kj) * scale;
-                    }
+                        int qiOffset = (i * HEADS + h) * HEAD_DIM;
+                        var qi = new ReadOnlySpan<float>(ptrQ + qiOffset, HEAD_DIM);
 
-                    TensorOperations.Softmax(scores);
+                        int startJ = Math.Max(0, i - window + 1);
+                        int endJ = i;
+                        int len = endJ - startJ + 1;
 
-                    var outH = output.AsSpan((i * HEADS + h) * HEAD_DIM, HEAD_DIM);
-                    outH.Clear();
+                        float[] scores = new float[len];
 
-                    for (int j = 0; j < len; j++)
-                    {
-                        int realJ = startJ + j;
-                        var vj = v.AsSpan((realJ * HEADS + h) * HEAD_DIM, HEAD_DIM);
-                        float score = scores[j];
-
-                        // out += score * v
-                        // Vectorized add with scalar mul
-                        // No TensorPrimitives op for Add(dest, src * scalar).
-                        // Loop manual
-                        for (int d = 0; d < HEAD_DIM; d++)
+                        for (int j = 0; j < len; j++)
                         {
-                            outH[d] += score * vj[d];
+                            int realJ = startJ + j;
+                            int kjOffset = (realJ * HEADS + h) * HEAD_DIM;
+                            var kj = new ReadOnlySpan<float>(ptrK + kjOffset, HEAD_DIM);
+                            scores[j] = TensorPrimitives.Dot(qi, kj) * scale;
+                        }
+
+                        TensorOperations.Softmax(scores);
+
+                        int outOffset = (i * HEADS + h) * HEAD_DIM;
+                        var outH = new Span<float>(ptrOut + outOffset, HEAD_DIM);
+                        outH.Clear();
+
+                        for (int j = 0; j < len; j++)
+                        {
+                            int realJ = startJ + j;
+                            int vjOffset = (realJ * HEADS + h) * HEAD_DIM;
+                            var vj = new ReadOnlySpan<float>(ptrV + vjOffset, HEAD_DIM);
+                            float score = scores[j];
+
+                            for (int d = 0; d < HEAD_DIM; d++)
+                            {
+                                outH[d] += score * vj[d];
+                            }
                         }
                     }
-                }
+                });
             }
         }
     }
