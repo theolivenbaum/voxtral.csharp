@@ -23,10 +23,10 @@ namespace Voxtral
         public const int N_LEFT_PAD_TOKENS = 32;
         public const int N_RIGHT_PAD_TOKENS = 17;
 
-        private float[] _melFiltersTransposed; // [NUM_MEL_BINS, numFreqBins] flattened
+        private Tensor<float> _melFiltersTransposed; // [NUM_MEL_BINS, numFreqBins]
         private float[] _hannWindow;
-        private float[] _dftReal; // [outputSize, WINDOW_SIZE] flattened
-        private float[] _dftImag; // [outputSize, WINDOW_SIZE] flattened
+        private Tensor<float> _dftReal; // [outputSize, WINDOW_SIZE]
+        private Tensor<float> _dftImag; // [outputSize, WINDOW_SIZE]
 
         public AudioProcessor()
         {
@@ -40,14 +40,8 @@ namespace Voxtral
             int N = WINDOW_SIZE;
             int outputSize = N / 2 + 1;
 
-            _dftReal = new float[outputSize * N];
-            _dftImag = new float[outputSize * N];
-
-            // Precompute DFT matrices
-            // We store them as [outputSize, N] so they can be used as weights in Linear (which expects [N_out, K_in])
-            // DFT formula: X[k] = sum(x[n] * exp(-j * 2 * pi * k * n / N))
-            // Real part weight: cos(-2*pi*k*n/N) = cos(2*pi*k*n/N)
-            // Imag part weight: sin(-2*pi*k*n/N) = -sin(2*pi*k*n/N)
+            float[] dftRealData = new float[outputSize * N];
+            float[] dftImagData = new float[outputSize * N];
 
             for (int k = 0; k < outputSize; k++)
             {
@@ -55,30 +49,33 @@ namespace Voxtral
                 for (int n = 0; n < N; n++)
                 {
                     double angle = angleTerm * n;
-                    // k is row, n is col
                     int idx = k * N + n;
-                    _dftReal[idx] = (float)Math.Cos(angle);
-                    _dftImag[idx] = (float)Math.Sin(angle);
+                    dftRealData[idx] = (float)Math.Cos(angle);
+                    dftImagData[idx] = (float)Math.Sin(angle);
                 }
             }
+
+            _dftReal = Tensor.Create(dftRealData, new nint[] { outputSize, N });
+            _dftImag = Tensor.Create(dftImagData, new nint[] { outputSize, N });
         }
 
         private void InitializeMelFilters()
         {
-            float[,] fb = ComputeMelFilters(); // [numFreqBins, NUM_MEL_BINS]
+            float[,] fb = ComputeMelFilters();
             int numFreqBins = fb.GetLength(0);
             int numMelBins = fb.GetLength(1);
 
-            // Transpose to [NUM_MEL_BINS, numFreqBins] flattened
-            _melFiltersTransposed = new float[numMelBins * numFreqBins];
+            float[] melFiltersData = new float[numMelBins * numFreqBins];
 
             for (int m = 0; m < numMelBins; m++)
             {
                 for (int f = 0; f < numFreqBins; f++)
                 {
-                    _melFiltersTransposed[m * numFreqBins + f] = fb[f, m];
+                    melFiltersData[m * numFreqBins + f] = fb[f, m];
                 }
             }
+
+            _melFiltersTransposed = Tensor.Create(melFiltersData, new nint[] { numMelBins, numFreqBins });
         }
 
         public float[] LoadAndPreprocessAudio(string filePath)
@@ -89,40 +86,32 @@ namespace Voxtral
 
         public Tensor<float> ComputeMelSpectrogram(float[] audio)
         {
-            // Center padding for STFT
             int pad = WINDOW_SIZE / 2;
             float[] paddedAudio = new float[audio.Length + 2 * pad];
 
-            // Reflect left
             for (int i = 0; i < pad; i++)
             {
                 int srcIdx = pad - 1 - i;
                 paddedAudio[i] = (srcIdx < audio.Length) ? audio[srcIdx] : 0;
             }
 
-            // Copy center
             Array.Copy(audio, 0, paddedAudio, pad, audio.Length);
 
-            // Reflect right
             for (int i = 0; i < pad; i++)
             {
                 int srcIdx = audio.Length - 2 - i;
                 paddedAudio[pad + audio.Length + i] = (srcIdx >= 0) ? audio[srcIdx] : 0;
             }
 
-            // Number of frames
             int nFrames = (paddedAudio.Length - WINDOW_SIZE) / HOP_LENGTH + 1;
-            nFrames -= 1; // Drop last frame
+            nFrames -= 1;
 
             if (nFrames <= 0) return Tensor.Create(new float[0], new nint[] { NUM_MEL_BINS, 0 });
 
             int numFreqBins = WINDOW_SIZE / 2 + 1;
 
-            // Prepare batch of frames
             float[] allFrames = new float[nFrames * WINDOW_SIZE];
 
-            // Fill frames
-            // We can parallelize this loop if needed, but it's memory bound mostly
             Parallel.For(0, nFrames, i =>
             {
                 int start = i * HOP_LENGTH;
@@ -136,68 +125,50 @@ namespace Voxtral
                 }
             });
 
-            // Compute DFT using Matrix Multiplication
-            float[] dftReal = new float[nFrames * numFreqBins];
-            float[] dftImag = new float[nFrames * numFreqBins];
+            Tensor<float> allFramesTensor = Tensor.Create(allFrames, new nint[] { nFrames, WINDOW_SIZE });
 
-            // Real part
-            TensorOperations.Linear(allFrames, _dftReal, ReadOnlySpan<float>.Empty, dftReal, nFrames, numFreqBins, WINDOW_SIZE);
-            // Imag part
-            TensorOperations.Linear(allFrames, _dftImag, ReadOnlySpan<float>.Empty, dftImag, nFrames, numFreqBins, WINDOW_SIZE);
+            float[] dftRealData = new float[nFrames * numFreqBins];
+            float[] dftImagData = new float[nFrames * numFreqBins];
 
-            // Compute Magnitudes Squared
-            float[] magnitudes = new float[nFrames * numFreqBins];
+            Tensor<float> dftRealTensor = Tensor.Create(dftRealData, new nint[] { nFrames, numFreqBins });
+            Tensor<float> dftImagTensor = Tensor.Create(dftImagData, new nint[] { nFrames, numFreqBins });
+
+            TensorOperations.Linear(allFramesTensor, _dftReal, null, dftRealTensor);
+            TensorOperations.Linear(allFramesTensor, _dftImag, null, dftImagTensor);
+
+            TensorSpan<float> realSpan = dftRealTensor;
+            TensorSpan<float> imagSpan = dftImagTensor;
+
+            // Compute magnitudes
             // magnitudes = real^2 + imag^2
-            // Vectorize this
-            int len = magnitudes.Length;
-            int vecSize = Vector<float>.Count;
-            int limit = len - (len % vecSize);
+            // We can reuse buffers or create new one.
+            float[] magnitudesData = new float[nFrames * numFreqBins];
+            Tensor<float> magnitudesTensor = Tensor.Create(magnitudesData, new nint[] { nFrames, numFreqBins });
+            TensorSpan<float> magSpan = magnitudesTensor;
 
-            for (int i = 0; i < limit; i += vecSize)
-            {
-                Vector<float> vr = new Vector<float>(dftReal.AsSpan(i));
-                Vector<float> vi = new Vector<float>(dftImag.AsSpan(i));
-                Vector<float> magSq = vr * vr + vi * vi;
-                magSq.CopyTo(magnitudes.AsSpan(i));
-            }
-            for (int i = limit; i < len; i++)
-            {
-                magnitudes[i] = dftReal[i] * dftReal[i] + dftImag[i] * dftImag[i];
-            }
-
-            // Apply Mel Filterbank using Matrix Multiplication
-            // magnitudes: [nFrames, numFreqBins]
-            // melFilters: [NUM_MEL_BINS, numFreqBins] (transposed)
-            // Output: [nFrames, NUM_MEL_BINS]
+            Tensor.Multiply<float>(realSpan, realSpan, realSpan);
+            Tensor.Multiply<float>(imagSpan, imagSpan, imagSpan);
+            Tensor.Add<float>(realSpan, imagSpan, magSpan);
 
             float[] melSpecDataTemp = new float[nFrames * NUM_MEL_BINS];
-            TensorOperations.Linear(magnitudes, _melFiltersTransposed, ReadOnlySpan<float>.Empty, melSpecDataTemp, nFrames, NUM_MEL_BINS, numFreqBins);
+            Tensor<float> melSpecTempTensor = Tensor.Create(melSpecDataTemp, new nint[] { nFrames, NUM_MEL_BINS });
 
-            // Transpose output to [NUM_MEL_BINS, nFrames] AND apply log compression
-            // The result structure required is [NUM_MEL_BINS, nFrames] (column-major effectively if viewed as [nFrames, MEL])
-            // But Tensor needs row-major of [NUM_MEL_BINS, nFrames].
-            // So we need to transpose melSpecDataTemp.
-            // melSpecDataTemp is [nFrames, NUM_MEL_BINS] (row-major).
-            // We need [NUM_MEL_BINS, nFrames].
+            TensorOperations.Linear(magnitudesTensor, _melFiltersTransposed, null, melSpecTempTensor);
 
             float[] finalMelSpec = new float[NUM_MEL_BINS * nFrames];
 
-            // Loop over nFrames (rows of temp) and NUM_MEL_BINS (cols of temp)
-            // Destination: dest[col * nFrames + row] = process(src[row * NUM_MEL_BINS + col])
-
             Parallel.For(0, nFrames, t =>
             {
+                var melSpecTempSpan = melSpecTempTensor.AsSpan();
                 for (int m = 0; m < NUM_MEL_BINS; m++)
                 {
-                    float val = melSpecDataTemp[t * NUM_MEL_BINS + m];
+                    float val = melSpecTempSpan[t * NUM_MEL_BINS + m];
 
-                    // Log compression
                     val = Math.Max(val, 1e-10f);
                     float logVal = (float)Math.Log10(val);
                     logVal = Math.Max(logVal, GLOBAL_LOG_MEL_MAX - 8.0f);
                     logVal = (logVal + 4.0f) / 4.0f;
 
-                    // Transpose write
                     finalMelSpec[m * nFrames + t] = logVal;
                 }
             });
@@ -205,7 +176,6 @@ namespace Voxtral
             return Tensor.Create(finalMelSpec, new nint[] { NUM_MEL_BINS, nFrames });
         }
 
-        // Keep helper methods ...
         private float[] ReadAudio(string filePath)
         {
             using var reader = new WaveFileReader(filePath);

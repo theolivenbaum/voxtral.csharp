@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Numerics.Tensors;
 using System.Threading.Tasks;
@@ -286,7 +287,7 @@ namespace Voxtral
             }
         }
 
-        private unsafe void PerformAttention(Tensor<float> q, Tensor<float> output, int pos, int seqLen)
+        private void PerformAttention(Tensor<float> q, Tensor<float> output, int pos, int seqLen)
         {
             int qHeads = HEADS;
             int kvHeads = KV_HEADS;
@@ -294,55 +295,54 @@ namespace Voxtral
             int dim = HEAD_DIM;
             float scale = 1.0f / MathF.Sqrt(dim);
 
-            fixed (float* pQ = q.AsSpan())
-            fixed (float* pOut = output.AsSpan())
-            fixed (float* pKCache = _kCache.AsSpan())
-            fixed (float* pVCache = _vCache.AsSpan())
+            Parallel.For(0, qHeads, h =>
             {
-                float* ptrQ = pQ;
-                float* ptrOut = pOut;
-                float* ptrKCache = pKCache;
-                float* ptrVCache = pVCache;
+                var qSpan = q.AsTensorSpan();
+                var outSpan = output.AsTensorSpan();
+                var kCacheSpan = _kCache.AsTensorSpan();
+                var vCacheSpan = _vCache.AsTensorSpan();
 
-                Parallel.For(0, qHeads, h =>
+                int kvH = h / gqaRatio;
+
+                for (int s = 0; s < seqLen; s++)
                 {
-                    int kvH = h / gqaRatio;
+                    int absPos = pos + s;
 
-                    for (int s = 0; s < seqLen; s++)
+                    nint qiOffset = ((nint)s * qHeads + h) * dim;
+                    var qi = qSpan.Slice(qiOffset, dim);
+
+                    int startP = Math.Max(0, absPos - WINDOW + 1);
+                    int endP = absPos;
+                    int len = endP - startP + 1;
+
+                    // Use ArrayPool to avoid allocation overhead
+                    float[] scoresArray = ArrayPool<float>.Shared.Rent(len);
+                    Span<float> scores = scoresArray.AsSpan(0, len);
+
+                    try
                     {
-                        int absPos = pos + s;
-
-                        int qiOffset = (s * qHeads + h) * dim;
-                        var qi = new ReadOnlySpan<float>(ptrQ + qiOffset, dim);
-
-                        int startP = Math.Max(0, absPos - WINDOW + 1);
-                        int endP = absPos;
-                        int len = endP - startP + 1;
-
-                        float[] scores = new float[len];
-
                         for (int j = 0; j < len; j++)
                         {
                             int pIdx = startP + j;
                             int cacheIdx = pIdx % WINDOW;
-                            int kOffset = (cacheIdx * kvHeads + kvH) * dim;
-                            var kj = new ReadOnlySpan<float>(ptrKCache + kOffset, dim);
+                            nint kOffset = ((nint)cacheIdx * kvHeads + kvH) * dim;
+                            var kj = kCacheSpan.Slice(kOffset, dim);
 
-                            scores[j] = TensorPrimitives.Dot(qi, kj) * scale;
+                            scores[j] = Tensor.Dot<float>(qi, kj) * scale;
                         }
 
                         TensorOperations.Softmax(scores);
 
-                        int outOffset = (s * qHeads + h) * dim;
-                        var outH = new Span<float>(ptrOut + outOffset, dim);
-                        outH.Clear();
+                        nint outOffset = ((nint)s * qHeads + h) * dim;
+                        var outH = outSpan.Slice(outOffset, dim);
+                        outH.Fill(0);
 
                         for (int j = 0; j < len; j++)
                         {
                             int pIdx = startP + j;
                             int cacheIdx = pIdx % WINDOW;
-                            int vOffset = (cacheIdx * kvHeads + kvH) * dim;
-                            var vj = new ReadOnlySpan<float>(ptrVCache + vOffset, dim);
+                            nint vOffset = ((nint)cacheIdx * kvHeads + kvH) * dim;
+                            var vj = vCacheSpan.Slice(vOffset, dim);
 
                             float score = scores[j];
 
@@ -352,8 +352,12 @@ namespace Voxtral
                             }
                         }
                     }
-                });
-            }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(scoresArray);
+                    }
+                }
+            });
         }
     }
 }
