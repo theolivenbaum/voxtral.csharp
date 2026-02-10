@@ -70,34 +70,42 @@ namespace Voxtral
             if (L > nAudio) throw new Exception("Audio too short");
 
             // Combine embeddings
-            float[] prefixEmbeds = new float[L * 3072];
+            float[] prefixEmbedsData = new float[L * 3072];
+            Tensor<float> prefixEmbeds = Tensor.Create(prefixEmbedsData, new nint[] { L, 3072 });
+
+            var prefixSpan = prefixEmbeds.AsSpan();
             var adapterSpan = adapterOut.AsSpan();
 
             for (int i = 0; i < L; i++)
             {
                 var txtEmb = _decoder.EmbedToken(promptIds[i]);
+                var txtEmbSpan = txtEmb.AsSpan();
                 var audEmb = adapterSpan.Slice(i * 3072, 3072);
 
                 for (int j = 0; j < 3072; j++)
                 {
-                    prefixEmbeds[i * 3072 + j] = txtEmb[j] + audEmb[j];
+                    prefixSpan[i * 3072 + j] = txtEmbSpan[j] + audEmb[j];
                 }
             }
 
             // Time Cond
-            float[] tCond = Decoder.ComputeTimeEmbedding(nDelay, 3072);
+            Tensor<float> tCond = Decoder.ComputeTimeEmbedding(nDelay, 3072);
 
             // Prefill
             if (L > 1)
             {
-                float[] prefillInput = new float[(L - 1) * 3072];
-                Array.Copy(prefixEmbeds, 0, prefillInput, 0, (L - 1) * 3072);
+                float[] prefillInputData = new float[(L - 1) * 3072];
+                // Copy from prefixEmbeds
+                prefixSpan.Slice(0, (L - 1) * 3072).CopyTo(prefillInputData);
+
+                Tensor<float> prefillInput = Tensor.Create(prefillInputData, new nint[] { L - 1, 3072 });
                 _decoder.Prefill(prefillInput, tCond);
             }
 
             // Generate first token
-            float[] lastEmbed = new float[3072];
-            Array.Copy(prefixEmbeds, (L - 1) * 3072, lastEmbed, 0, 3072);
+            float[] lastEmbedData = new float[3072];
+            prefixSpan.Slice((L - 1) * 3072, 3072).CopyTo(lastEmbedData);
+            Tensor<float> lastEmbed = Tensor.Create(lastEmbedData, new nint[] { 3072 });
 
             var logits = _decoder.ForwardOne(lastEmbed, L - 1, tCond);
             int token = ArgMax(logits);
@@ -112,10 +120,16 @@ namespace Voxtral
                 if (token == 2) break; // EOS
 
                 var txtEmb = _decoder.EmbedToken(token);
+                var txtEmbSpan = txtEmb.AsSpan();
+
+                // adapterSpan is valid here (captured from adapterOut)
                 var audEmb = adapterSpan.Slice(pos * 3072, 3072);
 
-                float[] embed = new float[3072];
-                for (int j = 0; j < 3072; j++) embed[j] = txtEmb[j] + audEmb[j];
+                float[] embedData = new float[3072];
+                // Manual add
+                for (int j = 0; j < 3072; j++) embedData[j] = txtEmbSpan[j] + audEmb[j];
+
+                Tensor<float> embed = Tensor.Create(embedData, new nint[] { 3072 });
 
                 logits = _decoder.ForwardOne(embed, pos, tCond);
                 token = ArgMax(logits);
@@ -132,15 +146,16 @@ namespace Voxtral
             return result;
         }
 
-        private int ArgMax(float[] logits)
+        private int ArgMax(Tensor<float> logits)
         {
+            var span = logits.AsSpan();
             float maxVal = float.NegativeInfinity;
             int maxIdx = -1;
-            for (int i = 0; i < logits.Length; i++)
+            for (int i = 0; i < span.Length; i++)
             {
-                if (logits[i] > maxVal)
+                if (span[i] > maxVal)
                 {
-                    maxVal = logits[i];
+                    maxVal = span[i];
                     maxIdx = i;
                 }
             }

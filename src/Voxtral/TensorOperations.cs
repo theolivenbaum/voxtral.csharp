@@ -43,6 +43,11 @@ namespace Voxtral
             }
         }
 
+        public static void RMSNorm(Tensor<float> x, Tensor<float> w, Tensor<float> y, float eps)
+        {
+            RMSNorm(x.AsSpan(), w.AsSpan(), y.AsSpan(), eps);
+        }
+
         public static void Softmax(Span<float> x)
         {
             float max = TensorPrimitives.Max(x);
@@ -50,6 +55,11 @@ namespace Voxtral
             TensorPrimitives.Exp(x, x);
             float sum = TensorPrimitives.Sum(x);
             TensorPrimitives.Divide(x, sum, x);
+        }
+
+        public static void Softmax(Tensor<float> x)
+        {
+            Softmax(x.AsSpan());
         }
 
         public static void SiLU(ReadOnlySpan<float> x, Span<float> y)
@@ -73,6 +83,11 @@ namespace Voxtral
 
                 offset += count;
             }
+        }
+
+        public static void SiLU(Tensor<float> x, Tensor<float> y)
+        {
+            SiLU(x.AsSpan(), y.AsSpan());
         }
 
         public static void Gelu(ReadOnlySpan<float> x, Span<float> y)
@@ -111,6 +126,11 @@ namespace Voxtral
 
                  offset += count;
              }
+        }
+
+        public static void Gelu(Tensor<float> x, Tensor<float> y)
+        {
+            Gelu(x.AsSpan(), y.AsSpan());
         }
 
         public static void Linear(ReadOnlySpan<float> x, ReadOnlySpan<float> w, ReadOnlySpan<float> b, Span<float> y, int M, int N, int K)
@@ -180,6 +200,17 @@ namespace Voxtral
                     }
                 }
             }
+        }
+
+        public static void Linear(Tensor<float> x, Tensor<float> w, Tensor<float>? b, Tensor<float> y)
+        {
+            // w is [N, K]
+            TensorSpan<float> ws = w;
+            int K = (int)ws.Lengths[1];
+            int N = (int)ws.Lengths[0];
+            int M = (int)(x.AsSpan().Length / K);
+
+            Linear(x.AsSpan(), w.AsSpan(), b != null ? b.AsSpan() : ReadOnlySpan<float>.Empty, y.AsSpan(), M, N, K);
         }
 
         public static void ApplyRoPE(Span<float> x, ReadOnlySpan<float> cos, ReadOnlySpan<float> sin, int seqLen, int nHeads, int headDim)
@@ -256,6 +287,11 @@ namespace Voxtral
                     }
                 }
             }
+        }
+
+        public static void ApplyRoPE(Tensor<float> x, Tensor<float> cos, Tensor<float> sin, int seqLen, int nHeads, int headDim)
+        {
+            ApplyRoPE(x.AsSpan(), cos.AsSpan(), sin.AsSpan(), seqLen, nHeads, headDim);
         }
     }
 }
