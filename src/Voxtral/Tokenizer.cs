@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -49,9 +50,11 @@ namespace Voxtral
             }
         }
 
-        public string Decode(IEnumerable<int> tokenIds)
+        private List<byte> _byteDecoderBuffer  = new List<byte>();
+
+        public string Decode(params ReadOnlySpan<int> tokenIds)
         {
-            List<byte> bytes = new List<byte>();
+            _byteDecoderBuffer.Clear();
             foreach (var id in tokenIds)
             {
                 if (id < _nSpecial || _specialIds.Contains(id))
@@ -61,12 +64,12 @@ namespace Voxtral
 
                 if (_tokenBytes.TryGetValue(id, out var b))
                 {
-                    bytes.AddRange(b);
+                    _byteDecoderBuffer.AddRange(b);
                 }
             }
             // Use simple string decoding. Handling partial UTF-8 sequences is complex (streaming decoder needed),
             // but for full sequence decoding this is fine.
-            return Encoding.UTF8.GetString(bytes.ToArray());
+            return Encoding.UTF8.GetString(CollectionsMarshal.AsSpan(_byteDecoderBuffer));
         }
 
         private class TekkenData
