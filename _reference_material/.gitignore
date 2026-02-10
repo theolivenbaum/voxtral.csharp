@@ -1,0 +1,6 @@
+voxtral_shaders_source.h
+voxtral
+voxtral-model/
+pyenv*/
+misc/
+*.o

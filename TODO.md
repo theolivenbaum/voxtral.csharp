@@ -1,0 +1,22 @@
+# TODO
+
+- [x] Project Setup
+    - [x] Create `Voxtral.sln`
+    - [x] Create `Voxtral` (Class Library)
+    - [x] Create `Voxtral.CLI` (Console App)
+    - [x] Add `NAudio` and `System.Numerics.Tensors` dependencies
+- [x] Core Implementation
+    - [x] SafetensorsReader (read model weights)
+    - [x] Audio Processor (WAV reading, resampling, Mel Spectrogram)
+    - [x] Tokenizer (Tekken tokenizer, `tekken.json`)
+    - [x] Tensor Operations (matmul, rmsnorm, swiglu, rope, attention)
+    - [x] Encoder (ConvStem, Transformer layers)
+    - [x] Adapter
+    - [x] Decoder (Pre-fill, Generation, KV Cache, Time Conditioning)
+    - [x] Model (Main class)
+- [x] CLI Implementation
+    - [x] Argument parsing (`-m`, `-i`)
+    - [x] Inference loop
+- [x] Verification
+    - [x] Unit tests for core components
+    - [x] CLI basic test
