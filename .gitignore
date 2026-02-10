@@ -1,6 +1,12 @@
-voxtral_shaders_source.h
-voxtral
-voxtral-model/
-pyenv*/
-misc/
-*.o
+# .NET
+bin/
+obj/
+.vs/
+.idea/
+*.user
+*.pdb
+*.suo
+*.dll
+*.exe
+*_output.txt
+_reference_material/
