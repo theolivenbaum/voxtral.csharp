@@ -135,82 +135,81 @@ namespace Voxtral
 
         public static void Linear(ReadOnlySpan<float> x, ReadOnlySpan<float> w, ReadOnlySpan<float> b, Span<float> y, int M, int N, int K)
         {
-            unsafe
+            bool hasBias = !b.IsEmpty;
+
+            // Standard sequential implementation (no unsafe, no Parallel.For)
+            for (int i = 0; i < M; i++)
             {
-                fixed (float* px = x)
-                fixed (float* pw = w)
-                fixed (float* pb = b)
-                fixed (float* py = y)
+                ReadOnlySpan<float> rowX = x.Slice(i * K, K);
+                Span<float> rowY = y.Slice(i * N, N);
+
+                for (int j = 0; j < N; j++)
                 {
-                    nint ptrX = (nint)px;
-                    nint ptrW = (nint)pw;
-                    nint ptrB = (nint)pb;
-                    nint ptrY = (nint)py;
+                    ReadOnlySpan<float> rowW = w.Slice(j * K, K);
 
-                    int bLen = b.Length; // Capture length
+                    float dot = TensorPrimitives.Dot(rowX, rowW);
 
-                    // Heuristic: if M is small (decoding), parallelize over N
-                    // If M is large (prefill), parallelize over M
-                    if (M < 4)
+                    if (hasBias)
                     {
-                        Parallel.For(0, N, j =>
-                        {
-                            float* pXLocal = (float*)ptrX;
-                            float* pWLocal = (float*)ptrW;
-                            float* pBLocal = (float*)ptrB;
-                            float* pYLocal = (float*)ptrY;
-
-                            ReadOnlySpan<float> rowW = new ReadOnlySpan<float>(pWLocal + j * K, K);
-                            float bias = (pBLocal != null && bLen > 0) ? pBLocal[j] : 0.0f;
-
-                            for (int i = 0; i < M; i++)
-                            {
-                                ReadOnlySpan<float> rowX = new ReadOnlySpan<float>(pXLocal + i * K, K);
-                                float dot = TensorPrimitives.Dot(rowX, rowW);
-                                (pYLocal + i * N)[j] = dot + bias;
-                            }
-                        });
+                        dot += b[j];
                     }
-                    else
-                    {
-                        Parallel.For(0, M, i =>
-                        {
-                            float* pXLocal = (float*)ptrX;
-                            float* pWLocal = (float*)ptrW;
-                            float* pBLocal = (float*)ptrB;
-                            float* pYLocal = (float*)ptrY;
 
-                            ReadOnlySpan<float> rowX = new ReadOnlySpan<float>(pXLocal + i * K, K);
-                            // RowY starts at pYLocal + i * N
-
-                            for (int j = 0; j < N; j++)
-                            {
-                                ReadOnlySpan<float> rowW = new ReadOnlySpan<float>(pWLocal + j * K, K);
-
-                                float dot = TensorPrimitives.Dot(rowX, rowW);
-
-                                if (pBLocal != null && bLen > 0)
-                                {
-                                    dot += pBLocal[j];
-                                }
-                                // Store result
-                                (pYLocal + i * N)[j] = dot;
-                            }
-                        });
-                    }
+                    rowY[j] = dot;
                 }
             }
         }
 
         public static void Linear(Tensor<float> x, Tensor<float> w, Tensor<float>? b, Tensor<float> y)
         {
-            // w is [N, K]
-            TensorSpan<float> ws = w;
-            int K = (int)ws.Lengths[1];
-            int N = (int)ws.Lengths[0];
-            int M = (int)(x.AsSpan().Length / K);
+            // x: [M, K]
+            // w: [N, K]
+            // y: [M, N]
+            TensorSpan<float> xSpan = x;
+            TensorSpan<float> wSpan = w;
+            TensorSpan<float> ySpan = y;
 
-            Linear(x.AsSpan(), w.AsSpan(), b != null ? b.AsSpan() : ReadOnlySpan<float>.Empty, y.AsSpan(), M, N, K);
+            // Check dimensions
+            int M = (int)x.Lengths[0];
+            int K = (int)x.Lengths[1];
+            int N = (int)w.Lengths[0];
+
+            // Bias handling
+            ReadOnlySpan<float> bSpan = b != null ? b.AsSpan() : ReadOnlySpan<float>.Empty;
+            bool hasBias = !bSpan.IsEmpty;
+
+            // Stack allocate index arrays to avoid heap allocations
+            Span<nint> xIndices = stackalloc nint[2];
+            Span<nint> wIndices = stackalloc nint[2];
+            Span<nint> yIndices = stackalloc nint[2];
+
+            // Iterate sequentially (no Parallel.For as requested)
+            for (int i = 0; i < M; i++)
+            {
+                xIndices[0] = i;
+                xIndices[1] = 0;
+                var rowX = xSpan.GetSpan(xIndices, K);
+
+                // Prepare Y row access
+                yIndices[0] = i;
+                yIndices[1] = 0;
+                var rowY = ySpan.GetSpan(yIndices, N);
+
+                for (int j = 0; j < N; j++)
+                {
+                    wIndices[0] = j;
+                    wIndices[1] = 0;
+                    var rowW = wSpan.GetSpan(wIndices, K);
+
+                    float dot = TensorPrimitives.Dot(rowX, rowW);
+
+                    if (hasBias)
+                    {
+                        dot += bSpan[j];
+                    }
+
+                    rowY[j] = dot;
+                }
+            }
         }
 
         public static void ApplyRoPE(Span<float> x, ReadOnlySpan<float> cos, ReadOnlySpan<float> sin, int seqLen, int nHeads, int headDim)

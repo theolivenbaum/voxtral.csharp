@@ -173,5 +173,58 @@ namespace Voxtral.Tests
 
             for(int i=0; i<dim; i++) Assert.Equal(expected[i], x[i], 1e-5f);
         }
+
+        [Fact]
+        public void Linear_TensorOverload_ComputesCorrectly()
+        {
+            int M = 4, N = 3, K = 2;
+
+            // x: [M, K]
+            float[] xData = {
+                1, 2,
+                3, 4,
+                5, 6,
+                7, 8
+            };
+            Tensor<float> x = Tensor.Create(xData, new nint[] { M, K });
+
+            // w: [N, K] (Output x Input)
+            float[] wData = {
+                0.1f, 0.2f,
+                0.3f, 0.4f,
+                0.5f, 0.6f
+            };
+            Tensor<float> w = Tensor.Create(wData, new nint[] { N, K });
+
+            // b: [N]
+            float[] bData = { 0.01f, 0.02f, 0.03f };
+            Tensor<float> b = Tensor.Create(bData, new nint[] { N });
+
+            // y: [M, N]
+            float[] yData = new float[M * N];
+            Tensor<float> y = Tensor.Create(yData, new nint[] { M, N });
+
+            // Expected
+            // Row 0: [1, 2] . [0.1, 0.2] + 0.01 = 0.1+0.4+0.01 = 0.51
+            //        [1, 2] . [0.3, 0.4] + 0.02 = 0.3+0.8+0.02 = 1.12
+            //        [1, 2] . [0.5, 0.6] + 0.03 = 0.5+1.2+0.03 = 1.73
+
+            TensorOperations.Linear(x, w, b, y);
+
+            var ySpan = y.AsSpan(); // Flattened for checking
+
+            Assert.Equal(0.51f, ySpan[0], 1e-4f);
+            Assert.Equal(1.12f, ySpan[1], 1e-4f);
+            Assert.Equal(1.73f, ySpan[2], 1e-4f);
+
+            // Check last row (Row 3): [7, 8]
+            //        [7, 8] . [0.1, 0.2] + 0.01 = 0.7+1.6+0.01 = 2.31
+            //        [7, 8] . [0.3, 0.4] + 0.02 = 2.1+3.2+0.02 = 5.32
+            //        [7, 8] . [0.5, 0.6] + 0.03 = 3.5+4.8+0.03 = 8.33
+
+            Assert.Equal(2.31f, ySpan[9], 1e-4f);
+            Assert.Equal(5.32f, ySpan[10], 1e-4f);
+            Assert.Equal(8.33f, ySpan[11], 1e-4f);
+        }
     }
 }
