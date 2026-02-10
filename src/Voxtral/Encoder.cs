@@ -145,12 +145,17 @@ namespace Voxtral
             int paddingTotal = kSize - stride;
             int outLen = (len + paddingTotal - kSize) / stride + 1;
 
+            // Get strides for flat indexing
+            nint inStride = input.Lengths[1];
+            nint outStride = output.Lengths[1];
+
             Parallel.For(0, cOut, o =>
             {
-                var inSpan = input.AsTensorSpan();
-                var wSpan = weight.AsTensorSpan();
-                var bSpan = bias.AsTensorSpan();
-                var outSpan = output.AsTensorSpan();
+                // Use flattened spans to avoid indexing issues with TensorSpan
+                var inSpan = input.AsSpan();
+                var wSpan = weight.AsSpan();
+                var bSpan = bias.AsSpan();
+                var outSpan = output.AsSpan();
 
                 float b = bSpan[o];
 
@@ -166,14 +171,14 @@ namespace Voxtral
                         {
                             for (int i = 0; i < cIn; i++)
                             {
-                                nint inputIdx = (nint)i * len + inT;
+                                nint inputIdx = (nint)i * inStride + inT;
                                 nint weightIdx = (nint)o * cIn * kSize + (nint)i * kSize + k;
 
-                                sum += inSpan[inputIdx] * wSpan[weightIdx];
+                                sum += inSpan[(int)inputIdx] * wSpan[(int)weightIdx];
                             }
                         }
                     }
-                    outSpan[(nint)o * outLen + t] = sum;
+                    outSpan[(int)((nint)o * outStride + t)] = sum;
                 }
             });
         }
