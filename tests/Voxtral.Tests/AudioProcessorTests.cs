@@ -37,9 +37,12 @@ namespace Voxtral.Tests
 
                 var mel = processor.ComputeMelSpectrogram(audio);
                 // Mel shape: [128, frames]
-                // Frames: (79360 - 400) / 160 + 1 = 78960 / 160 + 1 = 493 + 1 = 494
+                // Frames calculation updated due to reflect padding:
+                // Total samples: 79360 + 400 (reflect padding) = 79760
+                // Frames: (79760 - 400) / 160 + 1 = 497
+                // Then minus 1 (reference drops last frame) => 496
 
-                Assert.Equal(new nint[] { 128, 494 }, mel.Lengths.ToArray());
+                Assert.Equal(new nint[] { 128, 496 }, mel.Lengths.ToArray());
             }
             finally
             {
