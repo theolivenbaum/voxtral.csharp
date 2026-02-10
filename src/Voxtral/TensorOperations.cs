@@ -129,30 +129,55 @@ namespace Voxtral
 
                     int bLen = b.Length; // Capture length
 
-                    Parallel.For(0, M, i =>
+                    // Heuristic: if M is small (decoding), parallelize over N
+                    // If M is large (prefill), parallelize over M
+                    if (M < 4)
                     {
-                        float* pXLocal = (float*)ptrX;
-                        float* pWLocal = (float*)ptrW;
-                        float* pBLocal = (float*)ptrB;
-                        float* pYLocal = (float*)ptrY;
-
-                        ReadOnlySpan<float> rowX = new ReadOnlySpan<float>(pXLocal + i * K, K);
-                        // RowY starts at pYLocal + i * N
-
-                        for (int j = 0; j < N; j++)
+                        Parallel.For(0, N, j =>
                         {
+                            float* pXLocal = (float*)ptrX;
+                            float* pWLocal = (float*)ptrW;
+                            float* pBLocal = (float*)ptrB;
+                            float* pYLocal = (float*)ptrY;
+
                             ReadOnlySpan<float> rowW = new ReadOnlySpan<float>(pWLocal + j * K, K);
+                            float bias = (pBLocal != null && bLen > 0) ? pBLocal[j] : 0.0f;
 
-                            float dot = TensorPrimitives.Dot(rowX, rowW);
-
-                            if (pBLocal != null && bLen > 0)
+                            for (int i = 0; i < M; i++)
                             {
-                                dot += pBLocal[j];
+                                ReadOnlySpan<float> rowX = new ReadOnlySpan<float>(pXLocal + i * K, K);
+                                float dot = TensorPrimitives.Dot(rowX, rowW);
+                                (pYLocal + i * N)[j] = dot + bias;
                             }
-                            // Store result
-                            (pYLocal + i * N)[j] = dot;
-                        }
-                    });
+                        });
+                    }
+                    else
+                    {
+                        Parallel.For(0, M, i =>
+                        {
+                            float* pXLocal = (float*)ptrX;
+                            float* pWLocal = (float*)ptrW;
+                            float* pBLocal = (float*)ptrB;
+                            float* pYLocal = (float*)ptrY;
+
+                            ReadOnlySpan<float> rowX = new ReadOnlySpan<float>(pXLocal + i * K, K);
+                            // RowY starts at pYLocal + i * N
+
+                            for (int j = 0; j < N; j++)
+                            {
+                                ReadOnlySpan<float> rowW = new ReadOnlySpan<float>(pWLocal + j * K, K);
+
+                                float dot = TensorPrimitives.Dot(rowX, rowW);
+
+                                if (pBLocal != null && bLen > 0)
+                                {
+                                    dot += pBLocal[j];
+                                }
+                                // Store result
+                                (pYLocal + i * N)[j] = dot;
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -171,32 +196,64 @@ namespace Voxtral
                     nint ptrCos = (nint)pCos;
                     nint ptrSin = (nint)pSin;
 
-                    Parallel.For(0, seqLen, s =>
+                    if (seqLen < 4)
                     {
-                        float* pXLocal = (float*)ptrX;
-                        float* pCosLocal = (float*)ptrCos;
-                        float* pSinLocal = (float*)ptrSin;
-
-                        ReadOnlySpan<float> cosRow = new ReadOnlySpan<float>(pCosLocal + s * halfDim, halfDim);
-                        ReadOnlySpan<float> sinRow = new ReadOnlySpan<float>(pSinLocal + s * halfDim, halfDim);
-
-                        for (int h = 0; h < nHeads; h++)
+                        Parallel.For(0, nHeads, h =>
                         {
-                            int offset = (s * nHeads + h) * headDim;
-                            float* pHead = pXLocal + offset;
+                            float* pXLocal = (float*)ptrX;
+                            float* pCosLocal = (float*)ptrCos;
+                            float* pSinLocal = (float*)ptrSin;
 
-                            for (int i = 0; i < halfDim; i++)
+                            for (int s = 0; s < seqLen; s++)
                             {
-                                float val0 = pHead[2 * i];
-                                float val1 = pHead[2 * i + 1];
-                                float c = cosRow[i];
-                                float sn = sinRow[i];
+                                ReadOnlySpan<float> cosRow = new ReadOnlySpan<float>(pCosLocal + s * halfDim, halfDim);
+                                ReadOnlySpan<float> sinRow = new ReadOnlySpan<float>(pSinLocal + s * halfDim, halfDim);
 
-                                pHead[2 * i] = val0 * c - val1 * sn;
-                                pHead[2 * i + 1] = val1 * c + val0 * sn;
+                                int offset = (s * nHeads + h) * headDim;
+                                float* pHead = pXLocal + offset;
+
+                                for (int i = 0; i < halfDim; i++)
+                                {
+                                    float val0 = pHead[2 * i];
+                                    float val1 = pHead[2 * i + 1];
+                                    float c = cosRow[i];
+                                    float sn = sinRow[i];
+
+                                    pHead[2 * i] = val0 * c - val1 * sn;
+                                    pHead[2 * i + 1] = val1 * c + val0 * sn;
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
+                    else
+                    {
+                        Parallel.For(0, seqLen, s =>
+                        {
+                            float* pXLocal = (float*)ptrX;
+                            float* pCosLocal = (float*)ptrCos;
+                            float* pSinLocal = (float*)ptrSin;
+
+                            ReadOnlySpan<float> cosRow = new ReadOnlySpan<float>(pCosLocal + s * halfDim, halfDim);
+                            ReadOnlySpan<float> sinRow = new ReadOnlySpan<float>(pSinLocal + s * halfDim, halfDim);
+
+                            for (int h = 0; h < nHeads; h++)
+                            {
+                                int offset = (s * nHeads + h) * headDim;
+                                float* pHead = pXLocal + offset;
+
+                                for (int i = 0; i < halfDim; i++)
+                                {
+                                    float val0 = pHead[2 * i];
+                                    float val1 = pHead[2 * i + 1];
+                                    float c = cosRow[i];
+                                    float sn = sinRow[i];
+
+                                    pHead[2 * i] = val0 * c - val1 * sn;
+                                    pHead[2 * i + 1] = val1 * c + val0 * sn;
+                                }
+                            }
+                        });
+                    }
                 }
             }
         }
