@@ -1,8 +1,8 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\Voxtral\Voxtral.csproj" />
-    <ProjectReference Include="..\Voxtral.Onnx\Voxtral.Onnx.csproj" />
+    <ProjectReference Include="..\Voxtral.Onnx.DirectML\Voxtral.Onnx.DirectML.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
