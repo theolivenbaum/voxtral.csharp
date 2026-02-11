@@ -9,7 +9,6 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.24.1" />
-    <PackageReference Include="NAudio" Version="2.2.1" />
     <ProjectReference Include="..\Voxtral\Voxtral.csproj" />
   </ItemGroup>
 

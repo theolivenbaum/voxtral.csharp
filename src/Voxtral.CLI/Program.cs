@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using Voxtral;
 using Voxtral.Onnx;
+using Voxtral.Onnx.Gpu;
 
 namespace Voxtral.CLI
 {
