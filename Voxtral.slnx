@@ -6,6 +6,9 @@
   </Configurations>
   <Folder Name="/src/">
     <Project Path="src/Voxtral.CLI/Voxtral.CLI.csproj" />
+    <Project Path="src/Voxtral.DirectML.CLI/Voxtral.DirectML.CLI.csproj" />
+    <Project Path="src/Voxtral.Gpu.CLI/Voxtral.Gpu.CLI.csproj" />
+    <Project Path="src/Voxtral.Onnx.DirectML/Voxtral.Onnx.DirectML.csproj" />
     <Project Path="src/Voxtral.Onnx.Gpu/Voxtral.Onnx.Gpu.csproj" />
     <Project Path="src/Voxtral.Onnx/Voxtral.Onnx.csproj" />
     <Project Path="src/Voxtral/Voxtral.csproj" />

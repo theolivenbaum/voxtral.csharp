@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using Microsoft.ML.OnnxRuntime;
 using Voxtral;
 using Voxtral.Onnx.DirectML;
 
@@ -54,6 +55,9 @@ namespace Voxtral.DirectML.CLI
                 IVoxtralModel model;
                 if (backend == "onnx" || backend == "directml")
                 {
+                    var sessionOptions = new SessionOptions();
+                    sessionOptions.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
+                    sessionOptions.AppendExecutionProvider_DML(0);
                     model = new VoxtralOnnxDirectMLModel(modelDir);
                 }
                 else

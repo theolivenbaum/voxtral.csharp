@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Voxtral;
 
@@ -10,13 +11,14 @@ namespace Voxtral.Onnx.DirectML
 {
     public class VoxtralOnnxDirectMLModel : IVoxtralModel
     {
-        private OnnxSafetensorsReader _reader;
-        private OnnxEncoder _encoder;
-        private OnnxAdapter _adapter;
-        private OnnxDecoder _decoder;
-        private Tokenizer _tokenizer;
+        private readonly SessionOptions _sessionOptions;
+        private readonly OnnxSafetensorsReader _reader;
+        private readonly OnnxEncoder _encoder;
+        private readonly OnnxAdapter _adapter;
+        private readonly OnnxDecoder _decoder;
+        private readonly Tokenizer _tokenizer;
 
-        public VoxtralOnnxDirectMLModel(string modelDir)
+        public VoxtralOnnxDirectMLModel(string modelDir, Microsoft.ML.OnnxRuntime.SessionOptions sessionOptions)
         {
             var sw = Stopwatch.StartNew();
             Console.WriteLine("Loading model (ONNX DirectML Backend)...");
@@ -31,6 +33,7 @@ namespace Voxtral.Onnx.DirectML
             Console.WriteLine($"Loaded decoder in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
             _tokenizer = new Tokenizer(modelDir);
             Console.WriteLine($"Loaded tokenizer in {sw.Elapsed.TotalSeconds:n0}s...");
+            _sessionOptions = sessionOptions;
         }
 
         public void Dispose()
