@@ -9,7 +9,6 @@ namespace Voxtral.Onnx
 {
     public class VoxtralOnnxModel : IVoxtralModel
     {
-        private OnnxSafetensorsReader _reader;
         private OnnxEncoder _encoder;
         private OnnxAdapter _adapter;
         private OnnxDecoder _decoder;
@@ -19,22 +18,28 @@ namespace Voxtral.Onnx
         {
             var sw = Stopwatch.StartNew();
             Console.WriteLine("Loading model (ONNX Backend)...");
-            string safetensorsPath = Path.Combine(modelDir, "consolidated.safetensors");
-            _reader = new OnnxSafetensorsReader(safetensorsPath);
 
-            _encoder = new OnnxEncoder(_reader);
+            string encoderPath = Path.Combine(modelDir, "encoder.onnx");
+            string adapterPath = Path.Combine(modelDir, "adapter.onnx");
+
+            _encoder = new OnnxEncoder(encoderPath);
             Console.WriteLine($"Loaded encoder in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            _adapter = new OnnxAdapter(_reader);
-            Console.WriteLine($"Loaded reader in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            _decoder = new OnnxDecoder(_reader);
+
+            _adapter = new OnnxAdapter(adapterPath);
+            Console.WriteLine($"Loaded adapter in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
+
+            _decoder = new OnnxDecoder(modelDir);
             Console.WriteLine($"Loaded decoder in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
+
             _tokenizer = new Tokenizer(modelDir);
             Console.WriteLine($"Loaded tokenizer in {sw.Elapsed.TotalSeconds:n0}s...");
         }
 
         public void Dispose()
         {
-            _reader?.Dispose();
+            _encoder?.Dispose();
+            _adapter?.Dispose();
+            _decoder?.Dispose();
         }
 
         public string Transcribe(string wavPath)
@@ -55,7 +60,8 @@ namespace Voxtral.Onnx
             Console.WriteLine("Running Adapter...");
             var adapterOut = _adapter.Forward(encOut);
             Console.WriteLine($"Adapted audio in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            int nAudio = encSeqLen / 4; // Downsample factor
+
+            int nAudio = encSeqLen / 4;
 
             // Decoder
             Console.WriteLine("Running Decoder...");
@@ -66,8 +72,6 @@ namespace Voxtral.Onnx
             for (int i = 0; i < nLeftPad + nDelay; i++) promptIds.Add(32); // STREAMING_PAD
 
             int L = promptIds.Count;
-
-            if (L > nAudio) throw new Exception("Audio too short");
 
             // Combine embeddings
             float[] prefixEmbedsData = new float[L * 3072];
@@ -95,7 +99,6 @@ namespace Voxtral.Onnx
             if (L > 1)
             {
                 float[] prefillInputData = new float[(L - 1) * 3072];
-                // Copy from prefixEmbeds
                 prefixSpan.Slice(0, (L - 1) * 3072).CopyTo(prefillInputData);
 
                 DenseTensor<float> prefillInput = new DenseTensor<float>(prefillInputData, new int[] { L - 1, 3072 });
@@ -122,11 +125,9 @@ namespace Voxtral.Onnx
                 var txtEmb = _decoder.EmbedToken(token);
                 var txtEmbSpan = txtEmb.Buffer.Span;
 
-                // adapterSpan is valid here (captured from adapterOut)
                 var audEmb = adapterSpan.Slice(pos * 3072, 3072);
 
                 float[] embedData = new float[3072];
-                // Manual add
                 for (int j = 0; j < 3072; j++) embedData[j] = txtEmbSpan[j] + audEmb[j];
 
                 DenseTensor<float> embed = new DenseTensor<float>(embedData, new int[] { 3072 });
