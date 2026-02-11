@@ -1,9 +1,9 @@
 using System;
 using System.IO;
 using Voxtral;
-using Voxtral.Onnx;
+using Voxtral.Onnx.DirectML;
 
-namespace Voxtral.CLI
+namespace Voxtral.DirectML.CLI
 {
     class Program
     {
@@ -31,7 +31,7 @@ namespace Voxtral.CLI
 
             if (string.IsNullOrEmpty(inputFile))
             {
-                Console.WriteLine("Usage: voxtral -d <model_dir> -i <input.wav> [--backend <dotnet|onnx>]");
+                Console.WriteLine("Usage: voxtral-dml -d <model_dir> -i <input.wav> [--backend <dotnet|onnx|directml>]");
                 return;
             }
 
@@ -52,9 +52,9 @@ namespace Voxtral.CLI
                 Console.WriteLine($"Loading model from {modelDir} (Backend: {backend})...");
 
                 IVoxtralModel model;
-                if (backend == "onnx")
+                if (backend == "onnx" || backend == "directml")
                 {
-                    model = new VoxtralOnnxModel(modelDir);
+                    model = new VoxtralOnnxDirectMLModel(modelDir);
                 }
                 else
                 {
