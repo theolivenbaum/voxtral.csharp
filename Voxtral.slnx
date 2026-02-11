@@ -1,0 +1,16 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/src/">
+    <Project Path="src/Voxtral.CLI/Voxtral.CLI.csproj" />
+    <Project Path="src/Voxtral.Onnx.Gpu/Voxtral.Onnx.Gpu.csproj" />
+    <Project Path="src/Voxtral.Onnx/Voxtral.Onnx.csproj" />
+    <Project Path="src/Voxtral/Voxtral.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Voxtral.Tests/Voxtral.Tests.csproj" />
+  </Folder>
+</Solution>

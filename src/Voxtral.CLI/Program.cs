@@ -32,7 +32,7 @@ namespace Voxtral.CLI
 
             if (string.IsNullOrEmpty(inputFile))
             {
-                Console.WriteLine("Usage: voxtral -d <model_dir> -i <input.wav> [--backend <dotnet|onnx|onnx-gpu>]");
+                Console.WriteLine("Usage: voxtral -d <model_dir> -i <input.wav> [--backend <dotnet|onnx>]");
                 return;
             }
 
@@ -56,10 +56,6 @@ namespace Voxtral.CLI
                 if (backend == "onnx")
                 {
                     model = new VoxtralOnnxModel(modelDir);
-                }
-                else if (backend == "onnx-gpu")
-                {
-                    model = new VoxtralOnnxGpuModel(modelDir);
                 }
                 else
                 {
