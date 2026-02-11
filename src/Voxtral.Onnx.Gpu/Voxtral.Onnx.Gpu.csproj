@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.23.0" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.24.1" />
     <ProjectReference Include="..\Voxtral\Voxtral.csproj" />
   </ItemGroup>

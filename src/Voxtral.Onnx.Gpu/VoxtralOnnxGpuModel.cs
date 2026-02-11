@@ -40,12 +40,26 @@ namespace Voxtral.Onnx.Gpu
                 }
                 else
                 {
-                    Console.WriteLine($"OS/Arch not supported for CUDA (Linux/Windows X64 only). Fallback to CPU. Arch: {RuntimeInformation.ProcessArchitecture}");
+                    Console.WriteLine($"OS/Arch not supported for CUDA (Linux/Windows X64 only). Skipping CUDA. Arch: {RuntimeInformation.ProcessArchitecture}");
                 }
             }
             catch (Exception ex)
             {
-                 Console.WriteLine($"WARNING: Failed to initialize CUDA execution provider: {ex.Message}. Fallback to CPU.");
+                 Console.WriteLine($"WARNING: Failed to initialize CUDA execution provider: {ex.Message}. Proceeding without CUDA.");
+            }
+
+            // DirectML Execution Provider Configuration (Windows only)
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    options.AppendExecutionProvider_DML(0);
+                    Console.WriteLine("DirectML Execution Provider initialized.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"WARNING: Failed to initialize DirectML execution provider: {ex.Message}.");
             }
 
             // Load sessions
