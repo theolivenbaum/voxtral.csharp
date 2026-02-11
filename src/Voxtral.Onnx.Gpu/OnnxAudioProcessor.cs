@@ -7,6 +7,7 @@ using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using System.Threading.Tasks;
+using System.Numerics.Tensors;
 
 namespace Voxtral.Onnx.Gpu
 {
@@ -43,19 +44,12 @@ namespace Voxtral.Onnx.Gpu
             _dftReal = new float[outputSize * N];
             _dftImag = new float[outputSize * N];
 
-            // Precompute DFT matrices
-            // We store them as [outputSize, N] so they can be used as weights in Linear (which expects [N_out, K_in])
-            // DFT formula: X[k] = sum(x[n] * exp(-j * 2 * pi * k * n / N))
-            // Real part weight: cos(-2*pi*k*n/N) = cos(2*pi*k*n/N)
-            // Imag part weight: sin(-2*pi*k*n/N) = -sin(2*pi*k*n/N)
-
             for (int k = 0; k < outputSize; k++)
             {
                 double angleTerm = -2 * Math.PI * k / N;
                 for (int n = 0; n < N; n++)
                 {
                     double angle = angleTerm * n;
-                    // k is row, n is col
                     int idx = k * N + n;
                     _dftReal[idx] = (float)Math.Cos(angle);
                     _dftImag[idx] = (float)Math.Sin(angle);
@@ -69,7 +63,6 @@ namespace Voxtral.Onnx.Gpu
             int numFreqBins = fb.GetLength(0);
             int numMelBins = fb.GetLength(1);
 
-            // Transpose to [NUM_MEL_BINS, numFreqBins] flattened
             _melFiltersTransposed = new float[numMelBins * numFreqBins];
 
             for (int m = 0; m < numMelBins; m++)
@@ -89,40 +82,32 @@ namespace Voxtral.Onnx.Gpu
 
         public DenseTensor<float> ComputeMelSpectrogram(float[] audio)
         {
-            // Center padding for STFT
             int pad = WINDOW_SIZE / 2;
             float[] paddedAudio = new float[audio.Length + 2 * pad];
 
-            // Reflect left
             for (int i = 0; i < pad; i++)
             {
                 int srcIdx = pad - 1 - i;
                 paddedAudio[i] = (srcIdx < audio.Length) ? audio[srcIdx] : 0;
             }
 
-            // Copy center
             Array.Copy(audio, 0, paddedAudio, pad, audio.Length);
 
-            // Reflect right
             for (int i = 0; i < pad; i++)
             {
                 int srcIdx = audio.Length - 2 - i;
                 paddedAudio[pad + audio.Length + i] = (srcIdx >= 0) ? audio[srcIdx] : 0;
             }
 
-            // Number of frames
             int nFrames = (paddedAudio.Length - WINDOW_SIZE) / HOP_LENGTH + 1;
-            nFrames -= 1; // Drop last frame
+            nFrames -= 1;
 
             if (nFrames <= 0) return new DenseTensor<float>(new float[0], new int[] { NUM_MEL_BINS, 0 });
 
             int numFreqBins = WINDOW_SIZE / 2 + 1;
 
-            // Prepare batch of frames
             float[] allFrames = new float[nFrames * WINDOW_SIZE];
 
-            // Fill frames
-            // We can parallelize this loop if needed, but it's memory bound mostly
             Parallel.For(0, nFrames, i =>
             {
                 int start = i * HOP_LENGTH;
@@ -136,54 +121,27 @@ namespace Voxtral.Onnx.Gpu
                 }
             });
 
-            // Compute DFT using Matrix Multiplication
             float[] dftReal = new float[nFrames * numFreqBins];
             float[] dftImag = new float[nFrames * numFreqBins];
 
-            // Real part
-            OnnxTensorOperations.Linear(allFrames, _dftReal, ReadOnlySpan<float>.Empty, dftReal, nFrames, numFreqBins, WINDOW_SIZE);
-            // Imag part
-            OnnxTensorOperations.Linear(allFrames, _dftImag, ReadOnlySpan<float>.Empty, dftImag, nFrames, numFreqBins, WINDOW_SIZE);
+            MatMul(allFrames, _dftReal, dftReal, nFrames, numFreqBins, WINDOW_SIZE);
+            MatMul(allFrames, _dftImag, dftImag, nFrames, numFreqBins, WINDOW_SIZE);
 
-            // Compute Magnitudes Squared
             float[] magnitudes = new float[nFrames * numFreqBins];
-            // magnitudes = real^2 + imag^2
-            // Vectorize this
             int len = magnitudes.Length;
-            int vecSize = Vector<float>.Count;
-            int limit = len - (len % vecSize);
 
-            for (int i = 0; i < limit; i += vecSize)
-            {
-                Vector<float> vr = new Vector<float>(dftReal.AsSpan(i));
-                Vector<float> vi = new Vector<float>(dftImag.AsSpan(i));
-                Vector<float> magSq = vr * vr + vi * vi;
-                magSq.CopyTo(magnitudes.AsSpan(i));
-            }
-            for (int i = limit; i < len; i++)
-            {
-                magnitudes[i] = dftReal[i] * dftReal[i] + dftImag[i] * dftImag[i];
-            }
+            // magnitudes = real^2 + imag^2
+            TensorPrimitives.Multiply(dftReal, dftReal, magnitudes);
 
-            // Apply Mel Filterbank using Matrix Multiplication
-            // magnitudes: [nFrames, numFreqBins]
-            // melFilters: [NUM_MEL_BINS, numFreqBins] (transposed)
-            // Output: [nFrames, NUM_MEL_BINS]
+            for(int i=0; i<len; i++)
+            {
+                magnitudes[i] += dftImag[i] * dftImag[i];
+            }
 
             float[] melSpecDataTemp = new float[nFrames * NUM_MEL_BINS];
-            OnnxTensorOperations.Linear(magnitudes, _melFiltersTransposed, ReadOnlySpan<float>.Empty, melSpecDataTemp, nFrames, NUM_MEL_BINS, numFreqBins);
-
-            // Transpose output to [NUM_MEL_BINS, nFrames] AND apply log compression
-            // The result structure required is [NUM_MEL_BINS, nFrames] (column-major effectively if viewed as [nFrames, MEL])
-            // But Tensor needs row-major of [NUM_MEL_BINS, nFrames].
-            // So we need to transpose melSpecDataTemp.
-            // melSpecDataTemp is [nFrames, NUM_MEL_BINS] (row-major).
-            // We need [NUM_MEL_BINS, nFrames].
+            MatMul(magnitudes, _melFiltersTransposed, melSpecDataTemp, nFrames, NUM_MEL_BINS, numFreqBins);
 
             float[] finalMelSpec = new float[NUM_MEL_BINS * nFrames];
-
-            // Loop over nFrames (rows of temp) and NUM_MEL_BINS (cols of temp)
-            // Destination: dest[col * nFrames + row] = process(src[row * NUM_MEL_BINS + col])
 
             Parallel.For(0, nFrames, t =>
             {
@@ -191,13 +149,11 @@ namespace Voxtral.Onnx.Gpu
                 {
                     float val = melSpecDataTemp[t * NUM_MEL_BINS + m];
 
-                    // Log compression
                     val = Math.Max(val, 1e-10f);
                     float logVal = (float)Math.Log10(val);
                     logVal = Math.Max(logVal, GLOBAL_LOG_MEL_MAX - 8.0f);
                     logVal = (logVal + 4.0f) / 4.0f;
 
-                    // Transpose write
                     finalMelSpec[m * nFrames + t] = logVal;
                 }
             });
@@ -205,7 +161,20 @@ namespace Voxtral.Onnx.Gpu
             return new DenseTensor<float>(finalMelSpec, new int[] { NUM_MEL_BINS, nFrames });
         }
 
-        // Keep helper methods ...
+        private void MatMul(float[] A, float[] B, float[] C, int M, int N, int K)
+        {
+            // C[M, N] = A[M, K] * B[N, K]^T
+            Parallel.For(0, M, i =>
+            {
+                for (int j = 0; j < N; j++)
+                {
+                    var rowA = new ReadOnlySpan<float>(A, i * K, K);
+                    var rowB = new ReadOnlySpan<float>(B, j * K, K);
+                    C[i * N + j] = TensorPrimitives.Dot(rowA, rowB);
+                }
+            });
+        }
+
         private float[] ReadAudio(string filePath)
         {
             using var reader = new WaveFileReader(filePath);
@@ -277,7 +246,7 @@ namespace Voxtral.Onnx.Gpu
 
         private float[,] ComputeMelFilters()
         {
-            int numFreqBins = WINDOW_SIZE / 2 + 1; // 201
+            int numFreqBins = WINDOW_SIZE / 2 + 1;
             float[] fftFreqs = LinSpace(0, SAMPLE_RATE / 2.0f, numFreqBins);
             float melMin = HertzToMel(0.0f);
             float melMax = HertzToMel(8000.0f);

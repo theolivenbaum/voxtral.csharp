@@ -11,39 +11,51 @@ namespace Voxtral.Onnx.DirectML
 {
     public class VoxtralOnnxDirectMLModel : IVoxtralModel
     {
-        private readonly SessionOptions _sessionOptions;
-        private readonly OnnxSafetensorsReader _reader;
-        private readonly OnnxEncoder _encoder;
-        private readonly OnnxAdapter _adapter;
-        private readonly OnnxDecoder _decoder;
-        private readonly Tokenizer _tokenizer;
+        private OnnxEncoder _encoder;
+        private OnnxAdapter _adapter;
+        private OnnxDecoder _decoder;
+        private Tokenizer _tokenizer;
 
-        public VoxtralOnnxDirectMLModel(string modelDir, Microsoft.ML.OnnxRuntime.SessionOptions sessionOptions)
+        public VoxtralOnnxDirectMLModel(string modelDir)
         {
             var sw = Stopwatch.StartNew();
             Console.WriteLine("Loading model (ONNX DirectML Backend)...");
-            string safetensorsPath = Path.Combine(modelDir, "consolidated.safetensors");
-            _reader = new OnnxSafetensorsReader(safetensorsPath);
 
-            _encoder = new OnnxEncoder(_reader);
+            var options = new SessionOptions();
+            try
+            {
+                options.AppendExecutionProvider_DML(0);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to append DirectML provider: {ex.Message}. Falling back to default.");
+            }
+
+            string encoderPath = Path.Combine(modelDir, "encoder.onnx");
+            string adapterPath = Path.Combine(modelDir, "adapter.onnx");
+
+            _encoder = new OnnxEncoder(encoderPath, options);
             Console.WriteLine($"Loaded encoder in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            _adapter = new OnnxAdapter(_reader);
-            Console.WriteLine($"Loaded reader in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            _decoder = new OnnxDecoder(_reader);
+
+            _adapter = new OnnxAdapter(adapterPath, options);
+            Console.WriteLine($"Loaded adapter in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
+
+            _decoder = new OnnxDecoder(modelDir, options);
             Console.WriteLine($"Loaded decoder in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
+
             _tokenizer = new Tokenizer(modelDir);
             Console.WriteLine($"Loaded tokenizer in {sw.Elapsed.TotalSeconds:n0}s...");
-            _sessionOptions = sessionOptions;
         }
 
         public void Dispose()
         {
-            _reader?.Dispose();
+            _encoder?.Dispose();
+            _adapter?.Dispose();
+            _decoder?.Dispose();
         }
 
         public string Transcribe(string wavPath)
         {
-            // Audio
             var sw = Stopwatch.StartNew();
             Console.WriteLine("Processing audio...");
             var processor = new OnnxAudioProcessor();
@@ -51,29 +63,25 @@ namespace Voxtral.Onnx.DirectML
             var mel = processor.ComputeMelSpectrogram(audio);
             Console.WriteLine($"Loaded audio in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
 
-            // Encoder
             Console.WriteLine("Running Encoder...");
             var encOut = _encoder.Forward(mel, out int encSeqLen);
             Console.WriteLine($"Encoded audio in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            // Adapter
+
             Console.WriteLine("Running Adapter...");
             var adapterOut = _adapter.Forward(encOut);
             Console.WriteLine($"Adapted audio in {sw.Elapsed.TotalSeconds:n0}s..."); sw.Restart();
-            int nAudio = encSeqLen / 4; // Downsample factor
 
-            // Decoder
+            int nAudio = encSeqLen / 4;
+
             Console.WriteLine("Running Decoder...");
             int nLeftPad = OnnxAudioProcessor.N_LEFT_PAD_TOKENS;
             int nDelay = 6;
 
-            List<int> promptIds = new List<int> { 1 }; // BOS
-            for (int i = 0; i < nLeftPad + nDelay; i++) promptIds.Add(32); // STREAMING_PAD
+            List<int> promptIds = new List<int> { 1 };
+            for (int i = 0; i < nLeftPad + nDelay; i++) promptIds.Add(32);
 
             int L = promptIds.Count;
 
-            if (L > nAudio) throw new Exception("Audio too short");
-
-            // Combine embeddings
             float[] prefixEmbedsData = new float[L * 3072];
             DenseTensor<float> prefixEmbeds = new DenseTensor<float>(prefixEmbedsData, new int[] { L, 3072 });
 
@@ -92,21 +100,17 @@ namespace Voxtral.Onnx.DirectML
                 }
             }
 
-            // Time Cond
             DenseTensor<float> tCond = OnnxDecoder.ComputeTimeEmbedding(nDelay, 3072);
 
-            // Prefill
             if (L > 1)
             {
                 float[] prefillInputData = new float[(L - 1) * 3072];
-                // Copy from prefixEmbeds
                 prefixSpan.Slice(0, (L - 1) * 3072).CopyTo(prefillInputData);
 
                 DenseTensor<float> prefillInput = new DenseTensor<float>(prefillInputData, new int[] { L - 1, 3072 });
                 _decoder.Prefill(prefillInput, tCond);
             }
 
-            // Generate first token
             float[] lastEmbedData = new float[3072];
             prefixSpan.Slice((L - 1) * 3072, 3072).CopyTo(lastEmbedData);
             DenseTensor<float> lastEmbed = new DenseTensor<float>(lastEmbedData, new int[] { 3072 });
@@ -118,19 +122,16 @@ namespace Voxtral.Onnx.DirectML
             var sb = new StringBuilder();
             Console.Write(_tokenizer.Decode(token));
 
-            // Generate rest
             for (int pos = L; pos < nAudio; pos++)
             {
-                if (token == 2) break; // EOS
+                if (token == 2) break;
 
                 var txtEmb = _decoder.EmbedToken(token);
                 var txtEmbSpan = txtEmb.Buffer.Span;
 
-                // adapterSpan is valid here (captured from adapterOut)
                 var audEmb = adapterSpan.Slice(pos * 3072, 3072);
 
                 float[] embedData = new float[3072];
-                // Manual add
                 for (int j = 0; j < 3072; j++) embedData[j] = txtEmbSpan[j] + audEmb[j];
 
                 DenseTensor<float> embed = new DenseTensor<float>(embedData, new int[] { 3072 });
